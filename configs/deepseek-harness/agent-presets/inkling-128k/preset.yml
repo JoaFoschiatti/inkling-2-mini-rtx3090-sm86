@@ -1,3 +1,3 @@
 name: Inkling 128K (RTX 3090)
-description: Coding agent tuned for local 128K KV cache stability (append-only 24 KB spill bounding, no retroactive tool-result pruning, 85% compaction threshold with crisp 3K summaries).
+description: Coding agent tuned for local 128K KV cache stability (append-only 24 KB spill bounding, no retroactive tool-result pruning, 80% compaction threshold with 16K summary cap for reasoning headroom).
 order: 0

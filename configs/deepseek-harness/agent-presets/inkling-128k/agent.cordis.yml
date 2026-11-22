@@ -4,8 +4,8 @@
 #    and invalidated 80K+ of KV cache for a 77s stall to save ~2K tokens).
 #  - Pairs with `spill-policy.maxInlineBytes: 24000` (append-only bounding at creation time,
 #    0 ms KV cache invalidation).
-#  - Raises `compaction-basic` thresholdRatio to 0.85 (~111K), lowers retainTokens to 16384,
-#    and caps summary maxTokens to 3072 (~3x faster compaction when it does trigger).
+#  - Triggers `compaction-basic` at thresholdRatio 0.80 (~105K), retainTokens 16384,
+#    and maxTokens 16384 (ample headroom for reasoning + full summary so fail-closed compaction succeeds in 1 pass).
 
 # ── identity ────────────────────────────────────────────────────────────────
 
@@ -94,9 +94,9 @@
     - id: compaction-basic
       name: '@deepseek-ai/dsh-compaction-basic'
       config:
-        thresholdRatio: 0.85
+        thresholdRatio: 0.80
         retainTokens: 16384
-        maxTokens: 3072
+        maxTokens: 16384
 
     - id: command-compact
       name: '@deepseek-ai/dsh-command-compact'

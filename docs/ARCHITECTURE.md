@@ -98,4 +98,4 @@ Log analysis of a real 105K coding session revealed a **254 s (4.2 min) stall ac
 Our local preset ([configs/deepseek-harness/agent-presets/inkling-128k/](../configs/deepseek-harness/agent-presets/inkling-128k/agent.cordis.yml)) fixes both cleanly:
 - `tool-result-pruner: disabled: true` (zero retroactive prefix mutations).
 - `spill-policy.maxInlineBytes: 24000` (bounds oversized tool outputs **at creation time** — append-only, `0 ms` KV invalidation).
-- `compaction-basic`: `thresholdRatio: 0.85` (~111K), `retainTokens: 16384`, `maxTokens: 3072` (~3× faster compaction).
+- `compaction-basic`: `thresholdRatio: 0.80` (~105K), `retainTokens: 16384`, `maxTokens: 16384` (ample headroom for Inkling-2-Mini reasoning + full summary so fail-closed compaction succeeds on the first pass with 100 % KV prefix hit).
