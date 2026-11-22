@@ -31,13 +31,15 @@ All benchmarks in this repository (both the **stock baseline** and **Waves 1–1
 | Raw 1-token decode (`llama-bench tg256`, `d=0`) | `55.5 – 59.1 t/s` *(370 W)* | **`122.0 – 125.6 t/s`** *(280 W; `134.3` @ 370 W)* | **2.2× – 2.4×** |
 | Prompt prefill (`llama-bench pp512`, `d=0`) | `1,264 – 1,477 t/s` *(370 W)* | **`2,345 t/s`** *(280 W; `2,656` @ 370 W)* | **1.8× – 2.1×** |
 | CUDA graph kernel launches per decode token | `~5,000+` *(11,508 ggml nodes)* | **`524 ops/tok`** | **~10× fewer launches** |
-| Max context in 24 GB VRAM (+ DSpark + Vision) | `32K` (`~21.3 GiB`) | **`128K (131,072)`** (`22.2 GiB`, ~2.3 GiB free) | **4× context** |
+| Max context in 24 GB VRAM (+ DSpark + GPU Vision) | `32K` (`~21.3 GiB`) | **`128K (131,072)`** (`22.8` idle / `23.3 GiB` peak, ~1.25–1.75 GiB free) | **4× context** |
+| Vision encoding (`1440×810` PNG / `960×540` JPEG) | `5,835 ms` / `2,229 ms` *(CPU)* | **`785 ms`** / **`356 ms`** *(GPU `VISION_OFFLOAD=1`)* | **7.4× / 6.3× (16.4× vs PNG CPU)** |
 | Speculative verification `T = 5` (`llama-bench -d 512`) | `26.20 ms/step` *(Wave 7)* | **`16.47 ms/step`** *(303.7 t/s)* | **-37.1 % (1.59×)** |
 | Long-ctx `T = 5` attention @ `d = 128K` (Tensor Core MMA) | `~130 t/s` *(pre-MMA)* | **`180.0 t/s`** *(+38 %, `pp8 = 197.1 t/s`)* | **+38 – 40 %** |
 | DSpark `n=4` greedy (`temp=0.0` refactor, 100 % exact) | `~74 – 82 t/s` | **`194.0 t/s`** *(32K)* | **2.37×** |
 | DSpark `n=4` probabilistic (`temp=1.0`, exact Leviathan) | `0.50 t/s` *(broken)* | **`135–143 t/s`** *(32–64K w/ tools)* · **`125 t/s`** *(118K)* | **>250×** |
-| Live multi-turn `deepseek exec` (`tools` + `reasoning`) | `~55 – 58 t/s` *(no tools)* | **`131.6 – 164.8 t/s`** *(`f_keep = 1.000` 4/4 turns)* | **~2.5× – 2.9×** |
-| Long-session KV resilience (105K pruner / 1-tok BPE drift) | `77.1 s` freeze / full re-prefill | **`0 ms` pruner** + **`92.7 %` KV rescued** *(13.4× less re-prefill)* | **Eliminated stalls** |
+| High-entropy creative reasoning (`temp=1.0`, Wave 10C) | `91.6 – 97.3 t/s` *(cool)* · `78–85` *(warm)* | **`109.8 t/s`** *(EMA adaptive `T=5↔T=1`, 0 % code regression)* | **+13 % – +30 %** |
+| Live multi-turn `deepseek exec` (`fast-mcp` + GPU vision) | `~48–60 s` per visual check (`agent-browser`) | **`10.99 s` total** *(5-turn edit+Chrome+GPU vision, `114–180 t/s`)* | **~30–50× faster checks** |
+| Long-session KV resilience (105K pruner / 1-tok BPE drift) | `77.1 s` freeze / full re-prefill | **`0 ms` pruner** + **`92.7 %` KV rescued** *(SWA-1K + post-image ckpts)* | **Eliminated stalls** |
 | Accuracy vs unmodified `pr390` F16 ref (`inkcheck`) | Reference noise floor: `96.5 %` top-1 | **`96.0–100.0 %` top-1**, KLD `1.25e-3 – 5.41e-3`, `|z| ≤ 1.47` | **0 % loss** |
 
 ---
@@ -66,7 +68,7 @@ flowchart LR
 | **Wave 7 (A1/A2, 7A–7C)** | Inline producer `Q8_1` (`48/48`), full 3-kernel MoE pipeline, custom 1-token GQA=3 `cp.async.cg` RelPos Flash Attention, `GET_ROWS` fold, `need_probs` D2H skip | `816 → 524 ops/tok` (**-292 launches**); `tg256 → 134.3 t/s` (**2.27×**); reasoning `126–129 t/s` |
 | **Wave 8 (8.1–8.4)** | Zero-spill expert-grouped `T=2..8` MoE & attention fusions, rollback `shortconv4`, precomputed DSpark low-rank head `M=W_out·H` (`595→125 µs`), multi-block `argmax` (`40→5 µs`), `O(1)` `prob_of()`, **280 W cap** | `T=5` `26.20 → 16.47 ms` (**-37.1 %**); DSpark greedy `82 → 194.0 t/s` (**2.37×**); prob `0.50 → 129.9 t/s` (**260×**) |
 | **Wave 9 (9A–9D)** | On-the-fly RelPos in Flash Attention (**-15 GiB** tables → **128K**), selective KV `Q8_0` (8 global) + `F16` (40 SWA), **SM 8.6 Tensor Core `mma.sync.m16n8k16` Split-K**, hybrid GPU grammar sampling, stacked `T=5` spec + CPU vision | `32K → 128K` in `22.2 GiB`; `pp5@128K` **+38 % (`180 t/s`)**; JSON/Tools **+41 % / +32 %**; 120K real coding **`91.5–104.2 t/s`** |
-| **Wave 10 (Opt A + 10B + dsh)** | **Single-graph GPU probabilistic DSpark**, exact Leviathan GPU rejection sampling **with `tools`/`json_schema`/`reasoning_budget`**, **Wave 10B 4K generation checkpoints**, DeepSeek Harness `inkling-128k` preset | Single-graph prob **+20.4 %**; `32K/64K` w/ tools **`135–143 t/s` (+37–54 %)**; `118K` **`114–125 t/s`**; 1-tok drift re-prefill **13.4× less**; 77.1 s freeze **eliminated** |
+| **Wave 10 (10A–10D + GPU Vision + `fast-mcp`)** | **Single-graph GPU probabilistic DSpark**, exact Leviathan GPU rejection sampling **with `tools`/`json_schema`/`reasoning_budget`**, **Wave 10B/10D** 4K SWA-1K gen & post-image checkpoints, **Wave 10C** EMA adaptive `T=5↔T=1` gate, **GPU Vision (`VISION_OFFLOAD=1`)**, persistent **`fast-mcp.mjs`** (`browser`/`view_image`/`multi_edit`) | `32K/64K` w/ tools **`135–143 t/s` (+37–54 %)**; creative reasoning **`97.3 → 109.8 t/s` (+13–30 %)**; vision **6.3–7.9× (`356–785 ms`)**; visual check **`10–16 s → 0.21–0.48 s`**; live 5-turn E2E **`10.99 s`** (`114–180 t/s`) |
 
 Full technical breakdown → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · Complete benchmark tables & accuracy proofs → [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
 
@@ -85,7 +87,7 @@ Full technical breakdown → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · Com
 │   └── BENCHMARKS.md                # Full Wave 1–10 measurements, accuracy checks, and thermal profiles
 ├── scripts/                         # Production launcher (128K Wave 10), CLI chat, GPU thermal monitor & power cap
 ├── deploy/                          # systemd units (inkling-server + 280W power cap) and production env file
-├── configs/deepseek-harness/        # 128K local agent preset (inkling-128k), spill policy, and provider config
+├── configs/deepseek-harness/        # 128K local agent preset (inkling-128k), spill policy, fast-mcp.mjs (persistent Chrome/image/multi_edit MCP)
 └── tools/                           # inkcheck.cpp (KLD/NLL verifier), A/B harness, smoke tests, CUDA microbenchmarks
 ```
 
@@ -102,7 +104,7 @@ This clones [`unslothai/llama.cpp`](https://github.com/unslothai/llama.cpp) at b
 ### 2. Download weights into `models/`
 - `Inkling-2-Mini-UD-Q4_K_XL.gguf` (16.41 GiB)
 - `dspark-Inkling-2-Mini-Q8_0.gguf` (384 MiB)
-- `mmproj-F16.gguf` (610 MiB, runs on CPU with `0 MiB` VRAM via `--no-mmproj-offload`)
+- `mmproj-F16.gguf` (610 MiB, offloaded to GPU at 128K via `VISION_OFFLOAD=1` for 6.3–7.9× faster vision encoding; set `VISION_OFFLOAD=0` for CPU fallback)
 
 ### 3. Apply thermal cap & launch the 128K Wave 10 server
 ```bash

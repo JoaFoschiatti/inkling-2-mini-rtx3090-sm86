@@ -1,3 +1,3 @@
 name: Inkling 128K (RTX 3090 Optimized)
-description: Lean 13-tool coding agent tailored for local Inkling-2-Mini (native read/edit/grep/glob discipline, verify-after-edit, per-tool spill caps, no retroactive pruner, 72% compaction with 16K summary cap).
+description: Lean coding agent tailored for local Inkling-2-Mini with persistent fast-mcp (browser/view_image/multi_edit), native fs discipline, per-tool spill caps, no retroactive pruner, and 72% compaction with 24K summary cap.
 order: 0

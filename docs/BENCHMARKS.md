@@ -101,6 +101,22 @@ Real multi-turn agentic coding task (`Create fib.py + unittest suite, execute vi
 
 ---
 
+## 4B. Wave 10C/10D + GPU Vision (`VISION_OFFLOAD=1`) + `fast-mcp.mjs` A/B (128K, 280 W)
+
+| Benchmark (RTX 3090 @ 280 W, `CTX=131072`) | Baseline (`W10C/D OFF`, CPU Vision, `agent-browser`) | **Wave 10C/10D + GPU Vision + `fast-mcp`** | Improvement |
+| :--- | ---: | ---: | ---: |
+| Vision encode: `1440×810` PNG (`788` tok) | `5,835 ms` *(CPU)* | **`785 ms`** *(GPU, `23.33 GiB` peak)* | **7.4× faster** |
+| Vision encode: `960×540` JPEG (`355` tok) | `2,229 ms` *(CPU)* | **`356 ms`** *(GPU)* | **6.3× (16.4× vs PNG CPU)** |
+| High-entropy creative reasoning (`900` tok, `acc≈0.31`) | `91.6 – 97.3 t/s` | **`109.8 t/s`** *(4 EMA pauses)* | **+13 % – +20 %** |
+| Structured code + `tools` (`900` tok, `acc≈0.54`) | `133.2 t/s` | **`133.6 t/s`** | **0 % regression** |
+| Browser verification (cold boot / warm action + inline JPEG) | `10,000 – 16,210 ms` + `read_image` turn | **`308 – 476 ms`** (cold) / **`208 ms`** (warm) | **~25–60× faster** |
+| Multi-replacement file edit + `node --check` | 1–4 turns / `python3` heredoc | **`18.4 ms`** (`mcp__fast__multi_edit`) | **Atomic, 1 call** |
+| Local PNG downscale (`1440×810` → `960×540` JPEG) | `1.25 MB` raw (`~680` tok) | **`82.3 ms`** (`~40–70 KB`, `~290` tok) | **2.3× fewer tokens** |
+| **Live E2E `deepseek exec`** (edit HTML + Chrome + GPU vision) | `~48–60 s` per visual check | **`10.99 s` total** *(5 turns incl. `6.4K` cold pp, `114–180 t/s`, image turn `608 ms` pp)* | **Verified E2E** |
+| `tools/server-smoke.py 8080` | 5/5 OK | **5/5 TODO OK** (`tool_call: 174.1 t/s`, `chat: 122.9 t/s`) | **100 % healthy** |
+
+---
+
 ## 5. Accuracy & Statistical Verification
 
 Because Inkling-2-Mini quantizes activations to `int8` (`Q8_1`) before every GEMV, even the unmodified `pr390` reference differs from itself between batch size 1 and batch size 512 (`KLD = 4.36e-3`, `top-1 = 97.17 %`, `z = -1.96`). All builds were validated with [`tools/inkcheck.cpp`](../tools/inkcheck.cpp) against this exact noise floor:

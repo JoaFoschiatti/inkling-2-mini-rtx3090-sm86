@@ -1,0 +1,13 @@
+{
+  "version": 0,
+  "servers": {
+    "fast": {
+      "transport": "stdio",
+      "command": "/path/to/real/node",
+      "args": [
+        "/home/<user>/.dsh/tools/fast-mcp.mjs"
+      ],
+      "timeoutMs": 30000
+    }
+  }
+}
