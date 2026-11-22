@@ -107,6 +107,22 @@ class PersistentBrowser {
     this.failedRequests = [];
     this.reqUrls = new Map();
     this.loadResolvers = [];
+    this.idleTimer = null;
+  }
+
+  touchIdleTimer() {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      this.close().catch(() => {});
+    }, 10 * 60 * 1000);
+    if (typeof this.idleTimer.unref === "function") this.idleTimer.unref();
+  }
+
+  async setRafPaused(paused) {
+    if (!this.isAlive()) return;
+    try {
+      await this.evalJs(`window.__FMCP_SET_PAUSED && window.__FMCP_SET_PAUSED(${paused ? "true" : "false"})`, false);
+    } catch {}
   }
 
   resetLogs() {
@@ -266,7 +282,40 @@ class PersistentBrowser {
     await this.send("Page.enable");
     await this.send("Runtime.enable");
     await this.send("Network.enable");
+    await this.send("Network.setCacheDisabled", { cacheDisabled: true });
+    await this.send("Page.addScriptToEvaluateOnNewDocument", {
+      source: `(() => {
+        if (window.__FMCP_HOOKED) return;
+        window.__FMCP_HOOKED = true;
+        const origRAF = window.requestAnimationFrame.bind(window);
+        const origCAF = window.cancelAnimationFrame.bind(window);
+        let paused = false;
+        let nextFakeId = 1000000;
+        const queued = new Map();
+        window.requestAnimationFrame = function(cb) {
+          if (!paused) return origRAF(cb);
+          const fid = nextFakeId++;
+          queued.set(fid, cb);
+          return fid;
+        };
+        window.cancelAnimationFrame = function(id) {
+          if (queued.delete(id)) return;
+          return origCAF(id);
+        };
+        window.__FMCP_SET_PAUSED = function(p) {
+          p = !!p;
+          if (paused === p) return;
+          paused = p;
+          if (!paused && queued.size > 0) {
+            const cbs = Array.from(queued.values());
+            queued.clear();
+            for (const cb of cbs) origRAF(cb);
+          }
+        };
+      })();`,
+    });
     this.viewport = { width: 0, height: 0, mobile: false };
+    this.touchIdleTimer();
     return true;
   }
 
@@ -345,11 +394,13 @@ class PersistentBrowser {
   async runAction(act) {
     const type = act.type;
     if (type === "wait") {
-      await sleep(Math.min(Math.max(Number(act.ms) || 150, 0), 10000));
+      const rawMs = Number(act.ms ?? act.duration_ms);
+      await sleep(Math.min(Math.max(Number.isFinite(rawMs) ? rawMs : 150, 0), 10000));
       return null;
     }
     if (type === "wait_for") {
-      const deadline = Date.now() + Math.min(Math.max(Number(act.ms) || 5000, 100), 15000);
+      const rawMs = Number(act.ms ?? act.duration_ms);
+      const deadline = Date.now() + Math.min(Math.max(Number.isFinite(rawMs) ? rawMs : 5000, 100), 15000);
       while (Date.now() < deadline) {
         const r = await this.evalJs(`Boolean(document.querySelector(${JSON.stringify(act.selector || "")}))`, false);
         if (r.value) return { waited_for: act.selector, found: true };
@@ -454,6 +505,10 @@ class PersistentBrowser {
   }
 
   async close() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
     const ws = this.ws;
     const proc = this.proc;
     const dir = this.userDir;
@@ -491,88 +546,109 @@ async function handleBrowser(args) {
   }
 
   const cold = await browser.ensureRunning();
-  const width = Math.min(Math.max(Number(args.width) || 960, 240), 1920);
-  const height = Math.min(Math.max(Number(args.height) || 540, 240), 1440);
-  await browser.setViewport(width, height, Boolean(args.mobile));
+  browser.touchIdleTimer();
+  await browser.setRafPaused(false);
 
-  if (args.url) {
-    const u = String(args.url);
-    if (u.startsWith("file://")) {
-      resolveSafePath(new URL(u).pathname, { allowTmp: true, mustExist: true });
+  try {
+    const isMobile = Boolean(args.mobile);
+    const width = Math.min(Math.max(Number(args.width) || (isMobile ? 390 : 960), 240), 1920);
+    const height = Math.min(Math.max(Number(args.height) || (isMobile ? 844 : 540), 240), 1440);
+    await browser.setViewport(width, height, isMobile);
+
+    if (args.url) {
+      const u = String(args.url);
+      if (u.startsWith("file://")) {
+        resolveSafePath(new URL(u).pathname, { allowTmp: true, mustExist: true });
+      }
+      browser.resetLogs();
+      const curMeta = await browser.evalJs("location.href", false);
+      const sameUrl = typeof curMeta.value === "string" && curMeta.value === u;
+      const loadP = browser.waitForLoad(12000);
+      if (sameUrl && args.reload) {
+        await browser.send("Page.reload", { ignoreCache: true });
+      } else {
+        await browser.send("Page.navigate", { url: u });
+      }
+      await loadP;
+      const waitMs = args.wait_ms !== undefined ? Number(args.wait_ms) : 250;
+      if (waitMs > 0) await sleep(Math.min(waitMs, 10000));
+    } else if (args.reload) {
+      browser.resetLogs();
+      const loadP = browser.waitForLoad(12000);
+      await browser.send("Page.reload", { ignoreCache: true });
+      await loadP;
+      const waitMs = args.wait_ms !== undefined ? Number(args.wait_ms) : 250;
+      if (waitMs > 0) await sleep(Math.min(waitMs, 10000));
     }
-    browser.resetLogs();
-    const loadP = browser.waitForLoad(12000);
-    await browser.send("Page.navigate", { url: u });
-    await loadP;
-    const waitMs = args.wait_ms !== undefined ? Number(args.wait_ms) : 250;
-    if (waitMs > 0) await sleep(Math.min(waitMs, 10000));
-  } else if (args.reload) {
-    browser.resetLogs();
-    const loadP = browser.waitForLoad(12000);
-    await browser.send("Page.reload", { ignoreCache: true });
-    await loadP;
-    const waitMs = args.wait_ms !== undefined ? Number(args.wait_ms) : 250;
-    if (waitMs > 0) await sleep(Math.min(waitMs, 10000));
-  }
 
-  const evalResults = [];
-  const actions = Array.isArray(args.actions) ? args.actions : [];
-  for (let i = 0; i < actions.length; i++) {
-    const res = await browser.runAction(actions[i]);
-    if (res !== null) evalResults.push({ step: i, ...res });
-  }
-
-  const metaRes = await browser.evalJs("({ url: location.href, title: document.title })", false);
-  const meta = metaRes.value || {};
-  const snap = args.snapshot ? await browser.getSnapshot() : null;
-
-  const doShot = args.screenshot !== false;
-  let imageBlock = null;
-  let shotInfo = "none";
-
-  if (doShot) {
-    const format = args.format === "png" ? "png" : "jpeg";
-    const quality = Math.min(Math.max(Number(args.quality) || 82, 40), 95);
-    const params = format === "jpeg" ? { format: "jpeg", quality } : { format: "png" };
-    if (args.clip && typeof args.clip === "object") {
-      const cx = Math.max(0, Number(args.clip.x) || 0);
-      const cy = Math.max(0, Number(args.clip.y) || 0);
-      const cw = Math.max(16, Number(args.clip.width) || 300);
-      const ch = Math.max(16, Number(args.clip.height) || 300);
-      params.clip = { x: cx, y: cy, width: cw, height: ch, scale: 1 };
+    const evalResults = [];
+    const actions = Array.isArray(args.actions) ? args.actions : [];
+    for (let i = 0; i < actions.length; i++) {
+      const res = await browser.runAction(actions[i]);
+      if (res !== null) evalResults.push({ step: i, ...res });
     }
-    const shot = await browser.send("Page.captureScreenshot", params);
-    const b64 = shot.data;
-    const buf = Buffer.from(b64, "base64");
-    const mimeType = format === "png" ? "image/png" : "image/jpeg";
-    if (args.save_path) {
-      const outPath = resolveSafePath(String(args.save_path), { allowTmp: true, mustExist: false });
-      fs.mkdirSync(path.dirname(outPath), { recursive: true });
-      fs.writeFileSync(outPath, buf);
+
+    const metaRes = await browser.evalJs(
+      "({ url: location.href, title: document.title, hasCanvas: Boolean(document.querySelector('canvas')) })",
+      false
+    );
+    const meta = metaRes.value || {};
+    const snap = args.snapshot ? await browser.getSnapshot() : null;
+
+    const doShot = args.screenshot !== false;
+    let imageBlock = null;
+    let shotInfo = "none";
+
+    if (doShot) {
+      const format = args.format === "jpeg" ? "jpeg" : "png";
+      const quality = Math.min(Math.max(Number(args.quality) || 92, 40), 98);
+      const params = format === "jpeg" ? { format: "jpeg", quality } : { format: "png" };
+      if (args.clip && typeof args.clip === "object") {
+        const cx = Math.max(0, Number(args.clip.x) || 0);
+        const cy = Math.max(0, Number(args.clip.y) || 0);
+        const cw = Math.max(16, Number(args.clip.width) || 300);
+        const ch = Math.max(16, Number(args.clip.height) || 300);
+        params.clip = { x: cx, y: cy, width: cw, height: ch, scale: 1 };
+      }
+      const shot = await browser.send("Page.captureScreenshot", params);
+      const b64 = shot.data;
+      const buf = Buffer.from(b64, "base64");
+      const mimeType = format === "png" ? "image/png" : "image/jpeg";
+      if (args.save_path) {
+        const outPath = resolveSafePath(String(args.save_path), { allowTmp: true, mustExist: false });
+        fs.mkdirSync(path.dirname(outPath), { recursive: true });
+        fs.writeFileSync(outPath, buf);
+      }
+      const dimStr = params.clip ? `${params.clip.width}x${params.clip.height} clip` : `${width}x${height}`;
+      shotInfo = `${dimStr} ${format}, ${(buf.length / 1024).toFixed(1)} KB${args.save_path ? ` (saved: ${args.save_path})` : ""}`;
+      imageBlock = { type: "image", data: b64, mimeType };
     }
-    const dimStr = params.clip ? `${params.clip.width}x${params.clip.height} clip` : `${width}x${height}`;
-    shotInfo = `${dimStr} ${format}, ${(buf.length / 1024).toFixed(1)} KB${args.save_path ? ` (saved: ${args.save_path})` : ""}`;
-    imageBlock = { type: "image", data: b64, mimeType };
+
+    const summary = {
+      url: meta.url || "",
+      title: meta.title || "",
+      viewport: `${width}x${height}${isMobile ? " mobile" : ""}`,
+      cold_boot: cold,
+      elapsed_ms: Date.now() - t0,
+      screenshot: shotInfo,
+    };
+    if (meta.hasCanvas) {
+      summary.renderer_env = "headless-swiftshader-cpu (software WebGL; FPS is not representative of real GPUs)";
+    }
+    if (browser.consoleErrors.length) summary.console_errors = browser.consoleErrors;
+    if (browser.exceptions.length) summary.exceptions = browser.exceptions;
+    if (browser.consoleWarns.length) summary.console_warns = browser.consoleWarns;
+    if (browser.failedRequests.length) summary.failed_requests = browser.failedRequests;
+    if (evalResults.length) summary.results = evalResults;
+    if (snap) summary.snapshot = snap;
+
+    const content = [{ type: "text", text: JSON.stringify(summary, null, 2).slice(0, 8000) }];
+    if (imageBlock) content.push(imageBlock);
+    return { content };
+  } finally {
+    await browser.setRafPaused(true);
+    browser.touchIdleTimer();
   }
-
-  const summary = {
-    url: meta.url || "",
-    title: meta.title || "",
-    viewport: `${width}x${height}${args.mobile ? " mobile" : ""}`,
-    cold_boot: cold,
-    elapsed_ms: Date.now() - t0,
-    screenshot: shotInfo,
-  };
-  if (browser.consoleErrors.length) summary.console_errors = browser.consoleErrors;
-  if (browser.exceptions.length) summary.exceptions = browser.exceptions;
-  if (browser.consoleWarns.length) summary.console_warns = browser.consoleWarns;
-  if (browser.failedRequests.length) summary.failed_requests = browser.failedRequests;
-  if (evalResults.length) summary.results = evalResults;
-  if (snap) summary.snapshot = snap;
-
-  const content = [{ type: "text", text: JSON.stringify(summary, null, 2).slice(0, 8000) }];
-  if (imageBlock) content.push(imageBlock);
-  return { content };
 }
 
 async function handleViewImage(args) {
@@ -631,26 +707,162 @@ print(json.dumps({
   };
 }
 
+const _binCache = new Map();
+function findBinOnPath(name) {
+  if (_binCache.has(name)) return _binCache.get(name);
+  const dirs = (process.env.PATH || "/usr/local/bin:/usr/bin:/bin").split(path.delimiter);
+  for (const d of dirs) {
+    if (!d) continue;
+    const full = path.join(d, name);
+    try {
+      fs.accessSync(full, fs.constants.X_OK);
+      _binCache.set(name, full);
+      return full;
+    } catch {}
+  }
+  _binCache.set(name, null);
+  return null;
+}
+
+function findNearestFile(startDir, fileName) {
+  let cur = startDir;
+  while (cur && cur.startsWith(WORKSPACE_ROOT)) {
+    const cand = path.join(cur, fileName);
+    if (fs.existsSync(cand)) return cand;
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return null;
+}
+
 function runAutoSyntaxCheck(safePath) {
   const ext = path.extname(safePath).toLowerCase();
+  const checks = [];
   try {
     if (ext === ".js" || ext === ".mjs" || ext === ".cjs") {
       execFileSync(NODE_BIN, ["--check", safePath], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10000 });
-      return "syntax: OK (node --check)";
-    }
-    if (ext === ".py") {
+      checks.push("syntax: OK (node --check)");
+    } else if (ext === ".py") {
       execFileSync("/usr/bin/python3", ["-m", "py_compile", safePath], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10000 });
-      return "syntax: OK (py_compile)";
-    }
-    if (ext === ".json") {
+      checks.push("syntax: OK (py_compile)");
+      const ruffBin = findBinOnPath("ruff");
+      if (ruffBin) {
+        try {
+          execFileSync(ruffBin, ["check", "--output-format", "concise", "--no-fix", safePath], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+            timeout: 2500,
+          });
+          checks.push("lint: OK (ruff)");
+        } catch (rErr) {
+          const out = ((rErr.stdout || "") + "\n" + (rErr.stderr || "")).trim().split("\n").slice(0, 10).join("\n").slice(0, 800);
+          checks.push(`lint: FAILED (ruff)\n${out}`);
+        }
+      }
+    } else if (ext === ".ts" || ext === ".tsx") {
+      const tsconfig = findNearestFile(path.dirname(safePath), "tsconfig.json");
+      const localTsc = tsconfig ? path.join(path.dirname(tsconfig), "node_modules", ".bin", "tsc") : null;
+      const tscBin = localTsc && fs.existsSync(localTsc) ? localTsc : findBinOnPath("tsc");
+      if (tscBin && tsconfig) {
+        try {
+          execFileSync(tscBin, ["--noEmit", "--pretty", "false", "-p", tsconfig], {
+            encoding: "utf8",
+            stdio: ["ignore", "pipe", "pipe"],
+            timeout: 5000,
+          });
+          checks.push("types: OK (tsc)");
+        } catch (tErr) {
+          const out = ((tErr.stdout || "") + "\n" + (tErr.stderr || "")).trim().split("\n").slice(0, 12).join("\n").slice(0, 900);
+          checks.push(`types: FAILED (tsc)\n${out}`);
+        }
+      } else {
+        checks.push("syntax: skipped (no tsc/tsconfig)");
+      }
+    } else if (ext === ".json") {
       JSON.parse(fs.readFileSync(safePath, "utf8"));
-      return "syntax: OK (JSON.parse)";
+      checks.push("syntax: OK (JSON.parse)");
+    } else {
+      checks.push("syntax: skipped (unsupported ext)");
     }
-    return "syntax: skipped (unsupported ext)";
   } catch (err) {
     const detail = (err.stderr || err.stdout || err.message || "").toString().trim().slice(0, 800);
-    return `syntax: FAILED\n${detail}`;
+    checks.push(`syntax: FAILED\n${detail}`);
   }
+  return checks.join(" | ");
+}
+
+function runVerifyCmd(cmd, timeoutMs) {
+  const t0 = Date.now();
+  const capMs = Math.min(Math.max(Number(timeoutMs) || 15000, 1000), 60000);
+  const envPath = `${path.dirname(NODE_BIN)}${path.delimiter}${process.env.PATH || "/usr/local/bin:/usr/bin:/bin"}`;
+  try {
+    const out = execFileSync("/bin/bash", ["-lc", cmd], {
+      cwd: WORKSPACE_ROOT,
+      env: { ...process.env, PATH: envPath },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: capMs,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    const tail = out.trim().slice(-2000);
+    return `verify: OK (exit 0, ${Date.now() - t0} ms)${tail ? `\n${tail}` : ""}`;
+  } catch (err) {
+    const code = err.status ?? (err.killed ? "TIMEOUT" : 1);
+    const combined = ((err.stdout || "") + "\n" + (err.stderr || "")).trim();
+    const tail = (combined || err.message || "").slice(-2500);
+    return `verify: FAILED (exit ${code}, ${Date.now() - t0} ms)\n${tail}`;
+  }
+}
+
+async function handleReadBatch(args) {
+  const items = Array.isArray(args.items) ? args.items : [];
+  if (items.length === 0) throw new Error("items array must be non-empty");
+  if (items.length > 10) throw new Error("items array capped at 10 entries per call");
+
+  const maxTotalBytes = Math.min(Math.max(Number(args.max_total_bytes) || 28000, 2000), 48000);
+  const perItemCap = Math.max(1200, Math.floor(maxTotalBytes / items.length));
+  const sections = [];
+  let totalBytes = 0;
+
+  for (const item of items) {
+    if (!item || typeof item !== "object" || !item.file_path) {
+      sections.push("=== (invalid item: missing file_path) ===");
+      continue;
+    }
+    try {
+      const safePath = resolveSafePath(String(item.file_path), { allowTmp: true, mustExist: true });
+      const raw = fs.readFileSync(safePath, "utf8");
+      const lines = raw.split(/\r?\n/);
+      const offset = Math.max(1, Number(item.offset) || 1);
+      const limit = Math.min(Math.max(Number(item.limit) || 200, 1), 400);
+      const startIdx = Math.min(offset - 1, lines.length);
+      const endIdx = Math.min(startIdx + limit, lines.length);
+      const rel = safePath.startsWith(WORKSPACE_ROOT + path.sep)
+        ? safePath.slice(WORKSPACE_ROOT.length + 1)
+        : safePath;
+      let sec = `=== ${rel} (L${startIdx + 1}-${endIdx} of ${lines.length}) ===\n`;
+      for (let i = startIdx; i < endIdx; i++) {
+        const lineStr = `L${i + 1}: ${lines[i].slice(0, 1500)}\n`;
+        if (sec.length + lineStr.length > perItemCap) {
+          sec += `... [truncated at ${perItemCap}B cap; pass narrower offset/limit]\n`;
+          break;
+        }
+        sec += lineStr;
+      }
+      if (totalBytes + sec.length > maxTotalBytes) {
+        const rem = Math.max(0, maxTotalBytes - totalBytes);
+        if (rem > 120) sections.push(sec.slice(0, rem) + "\n... [total_bytes cap reached]");
+        break;
+      }
+      totalBytes += sec.length;
+      sections.push(sec.trimEnd());
+    } catch (err) {
+      sections.push(`=== ${item.file_path} (ERROR: ${err.message || String(err)}) ===`);
+    }
+  }
+
+  return { content: [{ type: "text", text: sections.join("\n\n") }] };
 }
 
 async function handleMultiEdit(args) {
@@ -693,12 +905,16 @@ async function handleMultiEdit(args) {
   fs.writeFileSync(safePath, cur, "utf8");
   const checkMode = args.check === "none" ? "none" : "auto";
   const checkMsg = checkMode === "auto" ? runAutoSyntaxCheck(safePath) : "syntax: skipped";
+  const verifyMsg =
+    typeof args.verify_cmd === "string" && args.verify_cmd.trim()
+      ? `\n${runVerifyCmd(args.verify_cmd.trim(), args.verify_timeout_ms)}`
+      : "";
   const deltaBytes = Buffer.byteLength(cur, "utf8") - Buffer.byteLength(orig, "utf8");
   return {
     content: [
       {
         type: "text",
-        text: `Updated ${safePath}: ${edits.length} edits applied (${applied.join(", ")}), delta=${deltaBytes >= 0 ? "+" : ""}${deltaBytes}B | ${checkMsg}`,
+        text: `Updated ${safePath}: ${edits.length} edits applied (${applied.join(", ")}), delta=${deltaBytes >= 0 ? "+" : ""}${deltaBytes}B | ${checkMsg}${verifyMsg}`,
       },
     ],
   };
@@ -710,15 +926,15 @@ const TOOLS = [
   {
     name: "browser",
     description:
-      "Persistent warm headless Chromium verifier. Reuses one browser across turns, executes compound actions in one call, reports console/JS/network errors, and returns a compact 960x540 JPEG screenshot inline (no read_image needed). Use clip for detail zooms.",
+      "Persistent warm headless Chromium verifier (HTTP cache disabled, pauses rAF when idle). Reuses one browser across turns, executes compound actions in one call, reports console/JS/network errors, and returns a lossless 960x540 PNG screenshot inline (no read_image needed; 390x844 when mobile=true). Use clip for detail zooms.",
     inputSchema: {
       type: "object",
       properties: {
         url: { type: "string", description: "URL to navigate to (omit to act on current page)." },
         reload: { type: "boolean", description: "Hard-reload current page first." },
-        width: { type: "integer", description: "Viewport width (default 960; mobile 390)." },
-        height: { type: "integer", description: "Viewport height (default 540; mobile 844)." },
-        mobile: { type: "boolean", description: "Mobile viewport mode." },
+        width: { type: "integer", description: "Viewport width (default 960; mobile default 390)." },
+        height: { type: "integer", description: "Viewport height (default 540; mobile default 844)." },
+        mobile: { type: "boolean", description: "Mobile viewport mode (defaults to 390x844)." },
         wait_ms: { type: "integer", description: "Settle ms after navigate/reload (default 250)." },
         actions: {
           type: "array",
@@ -746,8 +962,8 @@ const TOOLS = [
           },
         },
         screenshot: { type: "boolean", description: "Return inline screenshot (default true)." },
-        format: { type: "string", enum: ["jpeg", "png"] },
-        quality: { type: "integer", description: "JPEG quality 40-95 (default 82)." },
+        format: { type: "string", enum: ["png", "jpeg"], description: "Screenshot format (default lossless png)." },
+        quality: { type: "integer", description: "JPEG quality 40-98 when format=jpeg (default 92)." },
         clip: {
           type: "object",
           description: "Crop region {x,y,width,height} for zoomed detail.",
@@ -794,7 +1010,7 @@ const TOOLS = [
   {
     name: "multi_edit",
     description:
-      "Atomic multi-edit file patcher + instant syntax check (node --check / py_compile / JSON.parse). Replaces multi-step edits and inline python3 patch scripts.",
+      "Atomic multi-edit file patcher + instant syntax/lint/type check (node/py_compile/ruff/tsc/JSON) + optional verify_cmd to edit and run a test in ONE turn.",
     inputSchema: {
       type: "object",
       properties: {
@@ -812,8 +1028,33 @@ const TOOLS = [
           },
         },
         check: { type: "string", enum: ["auto", "none"] },
+        verify_cmd: { type: "string", description: "Optional shell command (e.g. pytest -q test_x.py) run immediately after edit in one turn." },
+        verify_timeout_ms: { type: "integer", description: "Timeout ms for verify_cmd (default 15000, max 60000)." },
       },
       required: ["file_path", "edits"],
+    },
+  },
+  {
+    name: "read_batch",
+    description:
+      "Read multiple files or line ranges in ONE turn (replaces sequential read loops). Bounded to 28 KB total.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        items: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              file_path: { type: "string" },
+              offset: { type: "integer", description: "1-based start line (default 1)." },
+              limit: { type: "integer", description: "Max lines (default 200, max 400)." },
+            },
+            required: ["file_path"],
+          },
+        },
+      },
+      required: ["items"],
     },
   },
 ];
@@ -858,6 +1099,7 @@ async function handleRequest(msg) {
       if (name === "browser") result = await handleBrowser(args);
       else if (name === "view_image") result = await handleViewImage(args);
       else if (name === "multi_edit") result = await handleMultiEdit(args);
+      else if (name === "read_batch") result = await handleReadBatch(args);
       else throw new Error(`Unknown tool: ${name}`);
       writeMsg({ jsonrpc: "2.0", id, result });
     } catch (err) {

@@ -8,7 +8,7 @@ llm-pi-ai:
     inkling-local:
       displayName: Inkling 2 Mini (Local RTX 3090)
       api: openai-completions
-      baseURL: http://127.0.0.1:8080/v1
+      baseURL: http://127.0.0.1:8081/v1
       apiKeyEnv: INKLING_LOCAL_API_KEY
       models:
         - id: inkling-2-mini

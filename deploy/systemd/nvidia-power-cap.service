@@ -1,11 +1,12 @@
 [Unit]
-Description=Set NVIDIA RTX 3090 Thermal Power Cap (280W)
+Description=Set NVIDIA RTX 3090 Thermal Power Cap (265W)
 After=multi-user.target
 
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/nvidia-smi -pm 1
-ExecStart=/usr/bin/nvidia-smi -pl 280
+ExecStart=/usr/bin/nvidia-smi -pl 265
+ExecStart=/usr/bin/nvidia-smi -lgc 210,1800
 RemainAfterExit=yes
 
 [Install]

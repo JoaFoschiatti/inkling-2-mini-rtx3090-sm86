@@ -1,0 +1,21 @@
+[Unit]
+Description=Inkling-2-Mini Local Adaptive Reasoning Budget & Telemetry Proxy (:8081 -> :8080)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env node %h/.dsh/tools/inkling-proxy.mjs
+Environment=PROXY_HOST=127.0.0.1
+Environment=PROXY_PORT=8081
+Environment=UPSTREAM_URL=http://127.0.0.1:8080
+Environment=HIGH_BUDGET=12288
+Environment=LOW_BUDGET=1536
+Environment=HIGH_EFFORT_LOW_BUDGET=3072
+Environment=COMPACT_BUDGET=0
+Environment=LOOP_PRESENCE_PENALTY=0.4
+Environment=INKLING_PROXY_LOG=%h/.dsh/logs/inkling-proxy.jsonl
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
