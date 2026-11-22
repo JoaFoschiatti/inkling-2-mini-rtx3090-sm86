@@ -6,18 +6,18 @@
 [![Contexto](https://img.shields.io/badge/Contexto-128K%20(131%2C072)-blue)](docs/ARCHITECTURE.md)
 [![Decode](https://img.shields.io/badge/Decode%20Ag%C3%A9ntico-131--165%20t%2Fs-brightgreen)](docs/BENCHMARKS.md)
 [![Precisión](https://img.shields.io/badge/Precisi%C3%B3n-0%25%20P%C3%A9rdida%20(inkcheck)-success)](docs/BENCHMARKS.md#accuracy--statistical-verification)
-[![Potencia](https://img.shields.io/badge/Tope%20T%C3%A9rmico-280W%20%E2%89%A482%C2%B0C-orange)](deploy/systemd/nvidia-power-cap.service)
+[![Potencia](https://img.shields.io/badge/Tope%20T%C3%A9rmico-265W%20%E2%89%A477%C2%B0C-orange)](deploy/systemd/nvidia-power-cap.service)
 
-> **De `55.5 t/s @ 32K` a `131–165 t/s` en programación agéntica multi-turno real y `114–125 t/s` a 118K de contexto en una única RTX 3090 de consumo (24 GB, 280 W) — con cero pérdida de precisión y decodificación especulativa probabilística exacta de Leviathan et al.**
+> **De `55.5 t/s @ 32K` a `131–165 t/s` en programación agéntica multi-turno real, `114–125 t/s` a 118K de contexto y `96.7 %` de KV cache hit sostenido (`0` rollbacks BPE en sesiones de 107 pasos y 29 imágenes) en una única RTX 3090 de consumo (24 GB, 265 W) — con cero pérdida de precisión y decodificación especulativa probabilística exacta de Leviathan et al.**
 
-Este repositorio reúne **~13,700 líneas de kernels CUDA Ampere SM 8.6 e ingeniería de motor de inferencia C++** desarrolladas sobre [`unslothai/llama.cpp`](https://github.com/unslothai/llama.cpp) (`pr390` @ `8aa2f23`), junto con el stack de producción completo a **128K** para **[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** (`UD-Q4_K_XL`, arquitectura *looped-transformer* + MoE NVFP4 de 128 expertos + atención híbrida SWA/global + drafter DSpark + proyector de visión).
+Este repositorio reúne **~20,150 líneas de kernels CUDA Ampere SM 8.6 e ingeniería de motor de inferencia C++ (Waves 1–13)** desarrolladas sobre [`unslothai/llama.cpp`](https://github.com/unslothai/llama.cpp) (`pr390` @ `8aa2f23`), junto con el stack de producción completo a **128K** (`inkling-proxy.mjs`, `fast-mcp.mjs`, plantilla Jinja $O(1)$) para **[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** (`UD-Q4_K_XL`, arquitectura *looped-transformer* + MoE NVFP4 de 128 expertos + atención híbrida SWA/global + drafter DSpark + proyector de visión).
 
 ---
 
 ## Hardware y Entorno de Pruebas (Importante para Reproducir)
 
-Todos los benchmarks de este repositorio (tanto el **baseline stock** como las **Waves 1–10**) se midieron en la misma máquina:
-- **GPU**: Gigabyte NVIDIA GeForce RTX 3090 (24 GB GDDR6X, Ampere SM 8.6), con tope térmico de **280 W** desde Wave 8 (`nvidia-power-cap.service`).
+Todos los benchmarks de este repositorio (tanto el **baseline stock** como las **Waves 1–13**) se midieron en la misma máquina:
+- **GPU**: Gigabyte NVIDIA GeForce RTX 3090 (24 GB GDDR6X, Ampere SM 8.6), con tope térmico de **280 W** en Waves 8–12 y **265 W (`-lgc 210,1800`)** desde Wave 13 (`nvidia-power-cap.service`, estable en `75–77 °C` sostenidos).
 - **Driver / SO**: Linux `x86_64`, NVIDIA Open Kernel Module `595.99.02`.
 - **Desbloqueo de Tensor Cores**: **[Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock) v2.0.0** activo desde el arranque (`SS0=0x88888888`, `SS1=0x8` — tasa completa `1:1` en Tensor Cores `FP16/BF16/TF32` con acumulador `FP32`).
   - **Qué cambia si alguien prueba *sin* `gpu-unlock`**: el decode `T=1` y los kernels MoE `NVFP4`/`Q8_0` (`dp4a`) están limitados por ancho de banda GDDR6X y rinden prácticamente igual. En cambio, el **prefill (`pp512`, 32K–128K)** y el kernel **Wave 9B Flash Attention `mma.sync.m16n8k16` (`FP16→FP32`) Split-K** (`T=2..8` a 64K–128K) sí dependen directamente de la tasa de Tensor Cores `FP16→FP32`, por lo que darán valores absolutos menores sin `gpu-unlock`. La mejora relativa frente al baseline se mantiene porque tanto el baseline como las Waves 1–10 se midieron bajo el mismo entorno.
@@ -44,7 +44,7 @@ Todos los benchmarks de este repositorio (tanto el **baseline stock** como las *
 
 ---
 
-## Evolución Wave por Wave (1 → 10)
+## Evolución Wave por Wave (1 → 13)
 
 | Wave | Hito de Ingeniería | Antes → Después (medido en RTX 3090) |
 | :--- | :--- | :--- |
@@ -55,6 +55,9 @@ Todos los benchmarks de este repositorio (tanto el **baseline stock** como las *
 | **Wave 8 (8.1–8.4)** | Fusiones `T=2..8` zero-spill agrupadas por experto, `shortconv4` con rollback, cabeza DSpark low-rank `M=W_out·H` (`595→125 µs`), `argmax` multi-bloque (`40→5 µs`), `prob_of()` $O(1)$, **tope 280 W** | `T=5` `26.20 → 16.47 ms` (**-37.1 %**); DSpark greedy `82 → 194.0 t/s` (**2.37×**); prob `0.50 → 129.9 t/s` (**260×**) |
 | **Wave 9 (9A–9D)** | `RelPos` al vuelo en Flash Attention (**-15 GiB** → **128K**), KV `Q8_0` selectivo (8 globales) + `F16` (40 SWA), **Tensor Cores SM 8.6 `mma.sync.m16n8k16` Split-K**, muestreo híbrido GPU con gramáticas, especulación apilada `T=5` + visión CPU | `32K → 128K` en `22.2 GiB`; `pp5@128K` **+38 % (`180 t/s`)**; JSON/Tools **+41 % / +32 %**; 120K real **`91.5–104.2 t/s`** |
 | **Wave 10 (10A–10D + Visión GPU + `fast-mcp`)** | **DSpark probabilístico en 1 grafo GPU**, *rejection sampling* exacto con `tools`/`json_schema`/`reasoning_budget`, **Wave 10B/10D** checkpoints SWA-1K 4K + post-imagen, **Wave 10C** gate adaptativo EMA `T=5↔T=1`, **Visión GPU (`VISION_OFFLOAD=1`)**, MCP persistente **`fast-mcp.mjs`** (`browser`/`view_image`/`multi_edit`) | `32K/64K` con tools **`135–143 t/s` (+37–54 %)**; alta entropía **`97.3 → 109.8 t/s` (+13–30 %)**; visión **6.3–7.9× (`356–785 ms`)**; chequeo web **`10–16 s → 0.21–0.48 s`**; E2E 5 turnos **`10.99 s`** (`114–180 t/s`) |
+| **Wave 11 (Zero-D2H Spec + Prefill Split-K)** | ***Rejection sampling* Leviathan en GPU sin D2H** (`0 B` `q_probs` por PCIe, `16 B` resultado), **softmax DSpark fusionado + `draft_min_p` + CDF exacto**, scheduler dual para grafos inject de DSpark, **FA prefill Tensor-Core Split-K (`T=9..256`)**, batching de checkpoints `n-4` | Elimina stalls de D2H en `q_probs` y triple partición de turnos cortos de herramientas |
+| **Wave 12 (Higiene CPU + Gate por Tasa)** | **Gate adaptativo por tasa medida** (`cycle` vs `plain`), **memoización de gramática GBNF y vocabulario**, skip de reserva de sampler, **bucle de decode de 1 hilo (`THREADS=1`)** | Menor carga CPU en host; conmutación `T=5↔T=1` más precisa sin regresión en código |
+| **Wave 13 + Stack Agéntico de Producción** | **`base64_decode` LUT 256 B + `data:` URI zero-copy**, **caché incremental lossless de prefijo + tokens generados + LRU de 48 imágenes** con hidratación en rollback, `media_min_gap=2048` en `wave10d`, plantilla Jinja $O(1)$, **`inkling-proxy.mjs`** (compactación con KV-hit + `budget=0`, `bash_high_effort`, `low_cap_escalate`, `loop_rescue`), **`fast-mcp.mjs` v2** (`read_batch`, PNG lossless, cache deshabilitado, pausa `rAF` reversible + autocierre 10 min, `mobile: true` 390×844), tope **`265 W`** | Sesión real 107 pasos / 29 PNGs: **`96.67 %` KV hit**, **`102/102` `f_keep=1.000` (0 rollbacks BPE)**, 4 compactaciones **`94.9–97.6 %` KV hit (`10.9 s` vs `736 s`)**, `preCPU` **`164.2 → 22.9 s`**, Chrome idle **`1,071 % → 0.2 %` CPU**, **`0` swap**, **`75–77 °C`** |
 
 Documentación técnica detallada → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · Tablas completas de benchmarks y precisión → [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
 
@@ -63,14 +66,15 @@ Documentación técnica detallada → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.m
 ## Reproducción rápida (RTX 3090 / Ampere SM 8.6)
 
 ```bash
-# 1. Clonar unslothai/llama.cpp@8aa2f23, aplicar el parche Wave 10 y compilar SM 8.6
+# 1. Clonar unslothai/llama.cpp@8aa2f23, aplicar el parche Wave 13 y compilar SM 8.6
 ./patches/apply-and-build.sh
 
-# 2. Colocar los pesos GGUF en models/ y fijar el tope térmico de 280 W
-sudo ./scripts/gpu-power-cap.sh 280
+# 2. Colocar los pesos GGUF en models/ y fijar el tope térmico de 265 W
+sudo ./scripts/gpu-power-cap.sh 265
 
-# 3. Iniciar el servidor 128K Wave 10 y verificar 5/5 endpoints
+# 3. Iniciar el servidor 128K Wave 13 (+ proxy adaptativo opcional en :8081) y verificar 5/5 endpoints
 ./scripts/start-server.sh
+./configs/deepseek-harness/tools/inkling-proxy.mjs &
 python3 tools/server-smoke.py 8080
 ```
 

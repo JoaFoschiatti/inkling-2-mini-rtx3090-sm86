@@ -1,6 +1,6 @@
 # Technical Architecture & Optimization Deep-Dive
 
-This document details the CUDA kernel engineering, inference runtime changes, mathematical proofs, and multi-turn KV-cache systems work implemented across **Waves 1–10** for **Inkling-2-Mini** on **NVIDIA Ampere SM 8.6 (RTX 3090, 24 GB)**.
+This document details the CUDA kernel engineering, inference runtime changes, mathematical proofs, and multi-turn KV-cache systems work implemented across **Waves 1–13** for **Inkling-2-Mini** on **NVIDIA Ampere SM 8.6 (RTX 3090, 24 GB)**.
 
 ---
 
@@ -107,3 +107,34 @@ During extended creative reasoning stretches (`n_gen >= 256`) where DSpark accep
     1. `mcp__fast__browser`: warm persistent headless Chromium over raw CDP (`0 MiB` VRAM), compound actions (`click`/`drag`/`type`/`key`/`scroll`/`eval`/`wait_for`/`snapshot`), automatic console/exception/HTTP `≥400` capture, and **inline `960×540` JPEG screenshot** returned in the same tool result (`0.21–0.48 s` per check, zero extra `read_image` turn, native `clip` zoom).
     2. `mcp__fast__view_image`: fast Pillow Lanczos downscale (`max_dim: 960`) or pixel-crisp `clip` crop (`~82 ms`, 3–5× fewer vision tokens).
     3. `mcp__fast__multi_edit`: atomic multi-replacement file patcher with built-in syntax validation (`node --check` / `py_compile` / `JSON.parse`) in `~18 ms`, eliminating inline `python3 - <<EOF` bash patches.
+
+---
+
+## 4. Waves 11–13: Zero-D2H Speculation, Lossless Token/Media Caching & Production Agentic Stack
+
+### 4.1 Wave 11: Zero-D2H GPU Leviathan Rejection & Tensor-Core Split-K Prefill
+- **Wave 11 Spec 2A (`W11_NO_GPU_REJECT=1`)**: Keeps DSpark's probabilistic `q_probs` tensor (`[n_vocab, n_rows]`) **resident on GPU** inside a persistent device buffer (`~5 µs` D2D copy, **`0 B` PCIe D2H**), and executes exact Leviathan et al. rejection sampling on GPU (`inkling-fused.cuh`, `src/llama-context.cpp`, `common/sampling.cpp`), transferring only `16 B` back to host.
+- **Wave 11 Spec 2B (`W11_NO_FUSED_DSPARK_SAMPLE=1`, `W11_DRAFT_MIN_P_SCALE`)**: Fuses DSpark's `ggml_soft_max` + optional lossless `draft_min_p` pruning + exact CDF categorical draw into a single CUDA kernel (`ggml-cuda.cu`), paired with a dedicated lightweight scheduler (`W11_NO_DFT_DUAL_SCHED=1`) for tiny `n_outputs == 0` DSpark inject graphs.
+- **Wave 11 Prefill (`W11_NO_PREFILL_DYN=1`, `W11_NO_PREFILL_SPLITK=1`)**: Adds runtime-`T_s` zero-block-sync SM 8.6 `m16n8k16` Split-K Flash Attention (`Path 2B` for short tool-result prefills `T_s = 9..24`, `Path 3` Split-K for medium/large prefills) plus `W11_NO_CKPT_OPT` tail checkpoint batching (`n - 4` only, preventing every short tool turn from splitting into 3 separate decode batches + 3 synchronous 168 MiB checkpoints).
+
+### 4.2 Wave 12: Measured-Rate Spec Gate & Host CPU Loop Hygiene
+- **Measured-Rate Adaptive Spec Gate (`W12_NO_RATE_GATE=1`)**: Replaces the static acceptance threshold in Wave 10C with a live break-even comparison (`spec_ema_tok / spec_ema_ms` vs measured plain `T=1` rate), adapting automatically as context grows from `4K` to `128K` and backing off cleanly if a pause underperforms speculation.
+- **CPU Hot-Path Memoization**: Memoizes GBNF grammar state transitions (`W12_NO_GRMR_MEMO=1`) and vocab token lookups (`W12_NO_TOK_MEMO=1`), skips redundant sampler candidate buffer reserves (`W12_NO_SAMPLER_RESERVE_SKIP=1`), and runs the decode loop with **`THREADS=1`** (`--threads 1 --threads-batch 1 --threads-draft 1`) so 7 idle host threads do not spin-wait per token while the vision encoder retains multithreading.
+
+### 4.3 Wave 13: 100 % Lossless `preCPU` & BPE Rollback Elimination (`tools/server/`)
+Driven by a 50.7-minute forensic production audit (`450` requests / `22` screenshots), Wave 13 eliminates every server-side CPU bottleneck on long multimodal agentic sessions with **0 % precision drift**:
+- **Wave 13.1 — Fast LUT `base64_decode` + Zero-Copy `data:` URI**: Replaces $O(64)$ `std::string::find()` per character + triple payload copy with a 256-byte `constexpr` lookup table, pre-reserved buffer, and `std::string_view` slicing in `handle_media()`.
+- **Wave 13.2 — Unified Incremental Prefix + Generated-Token + 48-Entry Image-Chunk LRU Cache (`W13_NO_TOK_CACHE=1`, `W13_NO_IMG_CACHE=1`)**:
+  - Caches up to 8 conversation prefixes with boundaries placed **strictly after prefix-free control tokens** (verified once per `vocab`, excluding `LSTRIP`/`RSTRIP`/`SINGLE_WORD` and checking `!llama_vocab_get_add_eos(vocab)`), guaranteeing 100 % identical tokenization to full re-tokenization.
+  - Clones matched prefixes in $O(1)$ with zero-byte media placeholders (`clone_prefix_placeholders`), pinning each chunk's `std::shared_ptr<mtmd_input_chunk>` on the task so that if a KV rollback ever occurs (`idx + n_tok > n_past`), `w13_hydrate_media_chunks()` materializes only the needed real chunks on demand in `SLOT_STATE_STARTED`.
+  - Records exact slot-generated token IDs (`slot.w13_gen_tokens`) in `send_final_response()`, preserving non-canonical BPE merges across `write`/`edit` turns and eliminating BPE drift KV rollbacks (`102 / 102` `f_keep = 1.000` in live 107-step testing).
+- **Wave 13.3 — `wave10d` Post-Image Checkpoint Spacing (`W13_NO_MEDIA_GAP=1`)**: Enforces a `media_min_gap` of `clamp(checkpoint_min_step / 2, 1024, 2048) = 2048` tokens before taking post-image checkpoints, preventing rapid screenshot bursts from spawning 30+ redundant 168 MiB checkpoints and exhausting host RAM/swap.
+- **Wave 13.4 — `send_final_response` Guard**: Skips detokenizing the full 90K-token prompt when `res_type != TASK_RESPONSE_TYPE_NONE` (OpenAI / Anthropic / Responses endpoints never serialize `res->prompt`).
+
+### 4.4 Production Stack: $O(1)$ Jinja, `inkling-proxy.mjs`, and `fast-mcp.mjs` v2
+- **$O(1)$ Chat Template ([templates/chat-template-inkling-o1.jinja](../templates/chat-template-inkling-o1.jinja))**: Replaces the GGUF template's $O(M^2)$ `for prev in messages` scan for `tool_call_id` resolution with a single $O(M)$ `dict(tc_pairs)` lookup (verified 100 % byte-exact to the GGUF template).
+- **Byte-Preserving Adaptive Proxy ([configs/deepseek-harness/tools/inkling-proxy.mjs](../configs/deepseek-harness/tools/inkling-proxy.mjs))**:
+  - Splices/replaces only top-level JSON fields (depth 1) without touching a single byte inside `messages`, `tools`, or `system`.
+  - Detects `dsh` compactions by header or prompt marker, **preserves the session's active `reasoning_effort`** even when `dsh` explicitly sends `"none"` (raising compaction KV cache hit from **`0 % → 94.9–97.6 %`**), and sets `reasoning_budget_tokens = 0`.
+  - Keeps full `HIGH_BUDGET = 12288` after `bash` in `high`/`xhigh`/`max` (`bash_high_effort`), auto-escalates after any low-budget cap hit (`low_cap_escalate`), and triggers `loop_rescue` (`presence_penalty = 0.4`, `HIGH_BUDGET`) on repeated identical tool calls.
+- **`fast-mcp.mjs` v2 ([configs/deepseek-harness/tools/fast-mcp.mjs](../configs/deepseek-harness/tools/fast-mcp.mjs))**: Adds `mcp__fast__read_batch` (multi-file/range batched reads), defaults to lossless PNG screenshots, disables HTTP cache (`Network.setCacheDisabled(true)`) + honors `reload: true` on same URL, installs a reversible `requestAnimationFrame` pause hook via `Page.addScriptToEvaluateOnNewDocument` + 10-min idle auto-close (dropping idle headless Chrome from `468–1,071 % CPU` to **`0.1–0.2 % CPU`**), reports SwiftShader software WebGL honestly on `<canvas>`, supports `duration_ms` alias, and sets `390×844` on `mobile: true`.

@@ -1,6 +1,6 @@
 # Verified Benchmarks & Accuracy Validation
 
-All measurements (both stock baselines and Waves 1–10) were collected on the same **Gigabyte NVIDIA GeForce RTX 3090 (24 GB GDDR6X, Ampere SM 8.6)** system running Linux (`x86_64`, NVIDIA Open Kernel Module `595.99.02`), serving `Inkling-2-Mini-UD-Q4_K_XL.gguf` (16.41 GiB) + `dspark-Inkling-2-Mini-Q8_0.gguf` (384 MiB) + `mmproj-F16.gguf` (610 MiB, CPU offload `0 MiB` VRAM).
+All measurements (both stock baselines and Waves 1–13) were collected on the same **Gigabyte NVIDIA GeForce RTX 3090 (24 GB GDDR6X, Ampere SM 8.6)** system running Linux (`x86_64`, NVIDIA Open Kernel Module `595.99.02`), serving `Inkling-2-Mini-UD-Q4_K_XL.gguf` (16.41 GiB) + `dspark-Inkling-2-Mini-Q8_0.gguf` (384 MiB) + `mmproj-F16.gguf` (610 MiB, GPU offload from Wave 10D onward).
 
 > **Environment disclosures (important for reproduction)**:
 > 1. **Tensor Core Unlock — [Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock) v2.0.0 active at boot** (`SS0=0x88888888`, `SS1=0x8`, unlocking full-rate `FP16/BF16/TF32 → FP32` Tensor Core throughput on GeForce RTX 3090). Both the baseline reference and Waves 1–10 ran with `gpu-unlock` enabled. On a stock GeForce RTX 3090 **without** `gpu-unlock`, memory-bound `T=1` decode and `NVFP4`/`Q8_0` `dp4a` kernels perform nearly identically, whereas **prompt prefill (`pp512`, 32K–128K)** and **Wave 9B `mma.sync.m16n8k16` (`FP16→FP32`) Split-K Flash Attention (`T=2..8` at 64K–128K)** will exhibit lower absolute throughput due to NVIDIA's stock half-rate FP32-accumulation cap.
@@ -114,6 +114,39 @@ Real multi-turn agentic coding task (`Create fib.py + unittest suite, execute vi
 | Local PNG downscale (`1440×810` → `960×540` JPEG) | `1.25 MB` raw (`~680` tok) | **`82.3 ms`** (`~40–70 KB`, `~290` tok) | **2.3× fewer tokens** |
 | **Live E2E `deepseek exec`** (edit HTML + Chrome + GPU vision) | `~48–60 s` per visual check | **`10.99 s` total** *(5 turns incl. `6.4K` cold pp, `114–180 t/s`, image turn `608 ms` pp)* | **Verified E2E** |
 | `tools/server-smoke.py 8080` | 5/5 OK | **5/5 TODO OK** (`tool_call: 174.1 t/s`, `chat: 122.9 t/s`) | **100 % healthy** |
+
+---
+
+## 4C. Wave 13 Lossless A/B Verification & Live Multi-Hour Production Audit (Run 1 → Run 3)
+
+### Isolated Wave 13 C++ A/B (`build-w12`, `temp=0.0`, `seed=42`, 15× `960×540` PNGs)
+| Test | Baseline (`W13_NO_TOK_CACHE=1, W13_NO_MEDIA_GAP=1`) | **Wave 13 Enabled** | Result |
+| :--- | ---: | ---: | :--- |
+| Greedy multi-turn exactness (text + tools + 2 images) | `167 / 275 / 339` tok | `167 / 275 / 339` tok | **100 % bit-exact output** |
+| KV eviction rollback + placeholder media hydration | `"Red"` (`396` tok) | `"Red"` (`396` tok, hydrated) | **PASS (lossless)** |
+| Follow-up `preCPU` median with 15× `960×540` PNGs | `235.1 ms` (`241.7 ms` on img #15) | **`86.8 ms`** (`93.8 ms` on img #15) | **2.71× faster** (~9× lower server overhead) |
+| BPE rollback after `write_note` w/ `----` & `""""` | — | **`0` tok rollback** (`hit=1`, `678/692`) | **PASS** |
+| Redundant `wave10d` checkpoints across 15 PNGs | `16` ckpts (`~2.7 GiB`) | **`0` redundant** (covered by `2048`-tok ckpt) | **PASS** |
+
+### Live Real-World Production Sessions (`deepseek` + `xhigh` + `fast-mcp` + `inkling-proxy`)
+Three complete real-world multi-turn frontend/SVG/WebGL coding sessions on RTX 3090 (24 GB):
+- **Run 1** (pre-Wave 13, 280 W): `50.7 min`, `443` steps, `237,604` generated tokens, `22` PNGs.
+- **Run 2** (Wave 13 + Bloque 1 + 265 W): `25.8 min`, `77` steps, `146,729` generated tokens, `19` PNGs.
+- **Run 3** (Run 2 + proxy compaction `effort:"none"` override & `bash_high_effort`, 265 W): `37.0 min`, `107` steps, `202,421` generated tokens, **`29` PNGs**, `58 KB` standalone deliverable (`daylight.html`).
+
+| Metric | Run 1 (Before) | Run 2 (Wave 13 + Bloque 1) | **Run 3 (+ Proxy v2, 265 W)** |
+| :--- | ---: | ---: | ---: |
+| Compaction KV cache hit & prefill time | `0 %` (`736.3 s` / 4 cmp) | `0 %` (`98.7 s` / 2 cmp) | **`94.9 – 97.6 %`** (**`10.9 s` total** / 4 cmp) |
+| Overall session KV cache hit | — | `94.64 %` | **`96.67 %`** (`7.14M / 7.39M` prompt tok) |
+| Non-compaction turns with `f_keep = 1.000` | 8 BPE rollbacks (`26.5 s`) | `73 / 77` | **`102 / 102`** (**0 BPE rollbacks**, incl. `25,347`-tok `write`) |
+| Repetitive tool loops | 235 stuck turns (`280.5 s`) | **`0`** | **`0`** (`max_consec = 0`) |
+| Total `preCPU` time across entire session | `164.2 s` (~500 ms/turn) | **`13.8 s`** (med `109 ms`) | **`22.9 s`** / 112 reqs (med `158 ms` w/ up to 29 PNGs) |
+| Idle headless Chrome CPU (`fast-mcp.mjs`) | `468 – 1,071 % CPU` | **`0.1 % CPU`** | **`0.2 % CPU`** after **48 browser calls** |
+| Redundant `wave10d` post-image checkpoints | `31` (`5.2 GiB`) | **`0`** | **`0`** (29 simultaneous PNGs) |
+| Host Swap growth (`CACHE_RAM=8192`) | `+3.0 GiB` swap | **`0` growth** | **`0` growth** (`15 GiB` RAM free) |
+| Sustained GPU temp & mean decode speed | `80–82 °C` @ `280 W` (`121.8 t/s`) | **`75–77 °C`** @ `265 W` (`112.6 t/s`, peak `161`) | **`75–77 °C`** @ `265 W` (`102.4 t/s` @ 60–94K ctx; **`141.5 t/s`** on 58 KB `write`) |
+
+`tools/server-smoke.py 8080` on live Wave 13 production server: **5/5 TODO OK** (`chat 115.3 t/s`, `vision OK`, `json_schema 96.6 t/s`, `tool_call 126.9 t/s`, `logprobs OK`).
 
 ---
 
