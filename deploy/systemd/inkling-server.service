@@ -1,0 +1,17 @@
+[Unit]
+Description=Inkling 2 Mini Local LLM Server (SM 8.6 Wave 10 CUDA · 128K)
+After=network.target nvidia-power-cap.service
+Wants=nvidia-power-cap.service
+
+[Service]
+Type=simple
+User=<YOUR_USER>
+Group=<YOUR_USER>
+WorkingDirectory=/path/to/inkling-2-mini
+EnvironmentFile=-/etc/default/inkling-server
+ExecStart=/path/to/inkling-2-mini/scripts/start-server.sh --no-webui
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

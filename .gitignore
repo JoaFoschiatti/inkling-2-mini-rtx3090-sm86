@@ -1,0 +1,21 @@
+# Model weights & large local artifacts
+models/
+*.gguf
+*.bin
+
+# Compiled binaries, toolchains & build trees
+bin/
+bin-sm86/
+build/
+src/
+toolchain/
+tools/inkcheck
+tools/ref/
+tools/microbench/*.out
+
+# Backups, logs & editor/OS files
+backups/
+*.log
+.DS_Store
+__pycache__/
+*.pyc

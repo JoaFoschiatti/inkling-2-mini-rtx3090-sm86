@@ -1,0 +1,8 @@
+# Local RTX 3090 128K optimizations (Wave 10)
+- id: agent-presets
+  config:
+    default: inkling-128k
+
+- id: spill-policy
+  config:
+    maxInlineBytes: 24000
