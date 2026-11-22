@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Reproducible build script for Inkling-2-Mini Custom SM 8.6 CUDA (Wave 10).
+# Reproducible build script for Inkling-2-Mini Custom SM 8.6 CUDA (Waves 1–13).
 # Clones unslothai/llama.cpp at base commit 8aa2f23 (branch pr390), applies
-# patches/inkling2-sm86-wave10.patch, builds SM 8.6 CUDA targets, and copies
+# patches/inkling2-sm86-wave13.patch, builds SM 8.6 CUDA targets, and copies
 # binaries + shared libraries into bin-sm86/.
 set -euo pipefail
 
@@ -9,7 +9,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/unslothai/llama.cpp.git}"
 UPSTREAM_BRANCH="${UPSTREAM_BRANCH:-pr390}"
 BASE_COMMIT="8aa2f23f6bbe0b2d23eb3ff676f318f96111d591"
-PATCH_FILE="$REPO_ROOT/patches/inkling2-sm86-wave10.patch"
+PATCH_FILE="$REPO_ROOT/patches/inkling2-sm86-wave13.patch"
 SRC_DIR="${SRC_DIR:-$REPO_ROOT/src/llama.cpp}"
 BUILD_DIR="${BUILD_DIR:-$SRC_DIR/build-sm86}"
 BIN_OUT="${BIN_OUT:-$REPO_ROOT/bin-sm86}"
@@ -23,7 +23,7 @@ fi
 git -C "$SRC_DIR" fetch origin "$BASE_COMMIT" --depth 1 2>/dev/null || true
 git -C "$SRC_DIR" checkout --force "$BASE_COMMIT"
 
-echo "==> 2. Applying Wave 10 SM 8.6 patch"
+echo "==> 2. Applying Wave 13 SM 8.6 patch"
 git -C "$SRC_DIR" apply --check "$PATCH_FILE"
 git -C "$SRC_DIR" apply "$PATCH_FILE"
 
