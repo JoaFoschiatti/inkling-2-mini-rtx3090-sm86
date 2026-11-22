@@ -95,7 +95,9 @@ Log analysis of a real 105K coding session revealed a **254 s (4.2 min) stall ac
 1. At 80 % context (`104.8K`), `tool-result-pruner` retroactively truncated one old tool output at token `23,203` — saving `2,153` tokens while invalidating **80,988 cached KV tokens** (`77.1 s` re-prefill!).
 2. Two turns later, `compaction-basic` ran anyway with `maxTokens: 8192` (`44.8 s` prefill + `82.3 s` generating a 7,197-token summary + `50.3 s` post-compaction prefill).
 
-Our local preset ([configs/deepseek-harness/agent-presets/inkling-128k/](../configs/deepseek-harness/agent-presets/inkling-128k/agent.cordis.yml)) fixes both cleanly:
-- `tool-result-pruner: disabled: true` (zero retroactive prefix mutations).
-- `spill-policy.maxInlineBytes: 24000` (bounds oversized tool outputs **at creation time** — append-only, `0 ms` KV invalidation).
-- `compaction-basic`: `thresholdRatio: 0.80` (~105K), `retainTokens: 16384`, `maxTokens: 16384` (ample headroom for Inkling-2-Mini reasoning + full summary so fail-closed compaction succeeds on the first pass with 100 % KV prefix hit).
+Our local preset ([configs/deepseek-harness/agent-presets/inkling-128k/](../configs/deepseek-harness/agent-presets/inkling-128k/agent.cordis.yml)) and profile patch ([configs/deepseek-harness/profiles/cordis.patch.yml](../configs/deepseek-harness/profiles/cordis.patch.yml)) fix both KV thrashing and Inkling-2-Mini tool-usage overhead:
+- **Lean 13-tool catalog** (`26 → 13` tools): disables single-GPU-hostile `delegation` (`workflow`/`subagent*`/`ralph`, which evict parent KV on `--parallel 1`), offline `web_search`, and unused `goal`/`skill` rows — cutting system + tool JSON overhead by **-48.7 % (`32,070 → 16,444 chars`, ~4.5K–5K tokens saved)** and shrinking the GBNF tool grammar in half.
+- **Inkling-2-Mini persona rules**: enforces native `read`/`edit`/`write`/`grep`/`glob` (eliminating verbose inline `python3 - << EOF` / `sed` bash hacks), verify-after-edit checks, parallel read batching, concise reasoning, and screenshot hygiene (`1–2` `read_image` calls per milestone, since `mtmd` chunks disable later KV checkpoints).
+- **`tool-result-pruner: disabled: true`** (zero retroactive prefix mutations) + bounded `tool-fs` (`readLimit: 400`, `readMaxBytes: 32768`).
+- **Per-tool append-only `spill-policy`** (`bash: 12 KB`, `grep: 12 KB`, `glob: 8 KB`, `read: 28 KB`, fallback `24 KB` — bounds oversized outputs at creation time with `0 ms` KV invalidation).
+- **`compaction-basic`**: `thresholdRatio: 0.72` (~94K, keeping working sessions in the RTX 3090 110–165 t/s sweet spot), `retainTokens: 16384`, `maxTokens: 16384` (ample headroom for Inkling-2-Mini reasoning + full summary so fail-closed compaction succeeds on the first pass).

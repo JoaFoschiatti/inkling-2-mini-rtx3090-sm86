@@ -1,11 +1,16 @@
-# Inkling 128K local agent preset (derived from shipped `standard` preset).
-# Tuned for local RTX 3090 128K KV cache stability:
-#  - Disables retroactive `tool-result-pruner` (which rewrote early tool outputs at ~23K
-#    and invalidated 80K+ of KV cache for a 77s stall to save ~2K tokens).
-#  - Pairs with `spill-policy.maxInlineBytes: 24000` (append-only bounding at creation time,
-#    0 ms KV cache invalidation).
-#  - Triggers `compaction-basic` at thresholdRatio 0.80 (~105K), retainTokens 16384,
-#    and maxTokens 16384 (ample headroom for reasoning + full summary so fail-closed compaction succeeds in 1 pass).
+# Inkling 128K Optimized Local Coding Preset (RTX 3090 SM 8.6 · Wave 10)
+# Empirically tuned from live Inkling-2-Mini + DeepSeek Harness sessions:
+#  1. Slim 13-tool catalog (disables single-GPU-hostile subagents/workflows + offline web_search
+#     + unused goal/skill tools): cuts cold prompt overhead from ~9,000 -> ~3,500 tokens and
+#     shrinks the GBNF tool-call grammar by >55 %.
+#  2. Inkling-2-Mini persona rules: enforces native read/edit/write/grep/glob (eliminates slow
+#     inline `python3 - << EOF` / `sed` bash hacks), verify-after-edit checks, parallel read
+#     batching, concise reasoning, and screenshot hygiene.
+#  3. Bounded `tool-fs` read window (`readLimit: 400`, `readMaxBytes: 32768`) + per-tool
+#     append-only `spill-policy` (bash=12KB, grep=12KB, glob=8KB, read=28KB, 0 ms KV invalidation).
+#  4. `tool-result-pruner` disabled (eliminates 77s retroactive KV cache invalidation).
+#  5. `compaction-basic` at `thresholdRatio: 0.72` (~94K), `retainTokens: 16384`, `maxTokens: 16384`
+#     (keeps sessions in the 110-165 t/s RTX 3090 sweet spot with zero fail-closed truncation loops).
 
 # ── identity ────────────────────────────────────────────────────────────────
 
@@ -13,12 +18,19 @@
   name: '@deepseek-ai/dsh-persona'
   config:
     text: >-
-      You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}.
+      You are a fast, disciplined coding agent powered by {{model}}. Working directory: {{cwd}}.
+
+      Core operating rules:
+      1. Native tools first — NEVER use bash for `cat`, `sed`, `head`, `tail`, `grep`, `rg`, `find`, or inline `python3` file-patching scripts. Always use `read` (with `offset`/`limit`), `grep`, `glob`, `edit` (exact surgical replacement), and `write`. Reserve `bash` strictly for builds, tests, linters, git, servers, and runtime checks.
+      2. Batch independent work — issue independent `read`, `grep`, and `glob` calls together in one turn instead of one-by-one.
+      3. Verify after editing — after modifying code, run the fastest relevant syntax, type, lint, or unit check (e.g., `node --check`, `python3 -m py_compile`, `pytest`, compiler/build) before moving on or reporting completion. Fix errors immediately.
+      4. Stay concise and concrete — keep internal reasoning focused on concrete hypotheses and direct next actions; avoid long repetitive monologues when a targeted `read`, `edit`, or test gives the exact answer.
+      5. Keep context lean — filter verbose command output (`| tail -n 60`, quiet test flags). When using `read_image`, take only 1-2 targeted verification screenshots per milestone because images stay in context and prevent later KV checkpoints.
 
 - id: agent-instructions
   name: '@deepseek-ai/dsh-agent-instructions'
   config:
-    maxBytes: 65536
+    maxBytes: 32768
 
 # ── shell ───────────────────────────────────────────────────────────────────
 
@@ -34,6 +46,10 @@
 
 - id: tool-fs
   name: '@deepseek-ai/dsh-tool-fs'
+  config:
+    readLimit: 400
+    readMaxLineLength: 2000
+    readMaxBytes: 32768
 
 - id: tool-fs-search
   name: '@deepseek-ai/dsh-tool-fs-search'
@@ -45,18 +61,21 @@
 - id: tool-jobs
   name: '@deepseek-ai/dsh-tool-jobs'
 
-# ── skills ──────────────────────────────────────────────────────────────────
+# ── skills (disabled by default: no local skills configured; set false to enable) ──
 
 - id: skill-filesystem
   name: '@deepseek-ai/dsh-skill-filesystem'
+  disabled: true
 
 - id: tool-skill
   name: '@deepseek-ai/dsh-tool-skill'
+  disabled: true
 
-# ── goals ───────────────────────────────────────────────────────────────────
+# ── goals (disabled by default to keep GBNF grammar & prompt lean; set false to enable) ──
 
 - id: tool-goal
   name: '@deepseek-ai/dsh-tool-goal'
+  disabled: true
 
 # ── plan mode ───────────────────────────────────────────────────────────────
 
@@ -72,15 +91,11 @@
         section: |
               You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
 
-              Explore first. Use non-mutating reads, searches, static analysis, and checks to ground the plan in the actual repository. Do not edit or write files, change configuration, run formatters or code generation that rewrites tracked files, commit, or otherwise carry out the plan. Prefer existing functions and patterns over new machinery.
+              Explore first using read, grep, glob, and non-mutating checks. Do not edit or write files or mutate state. Prefer existing functions and patterns over new machinery.
 
-              The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
+              Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity. Make the plan concise, concrete, and decision-complete (goal, subsystem changes, edge cases, verification steps).
 
-              Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
-
-              Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
-
-              When ready, call exit_plan_mode with the complete plan markdown, starting with a # title. Make exit_plan_mode the only and final tool call in that assistant response: it presents the plan for approval, and implementation begins only in a later step after approval. Do not paste the final plan as a plain reply or ask "should I proceed?" through prose or ask_user_question. If review rejects it, incorporate the feedback and present again. If the review channel is unavailable or aborted, stay in plan mode and ask the user to switch modes manually; do not proceed with implementation.
+              When ready, call exit_plan_mode with the complete plan markdown starting with `# ` as the only tool call in that response.
 
 # ── compaction ──────────────────────────────────────────────────────────────
 
@@ -94,7 +109,7 @@
     - id: compaction-basic
       name: '@deepseek-ai/dsh-compaction-basic'
       config:
-        thresholdRatio: 0.80
+        thresholdRatio: 0.72
         retainTokens: 16384
         maxTokens: 16384
 
@@ -109,11 +124,12 @@
         headChars: 4096
         tailChars: 1024
 
-# ── delegation and workflows ────────────────────────────────────────────────
+# ── delegation and workflows (disabled on --parallel 1 single-GPU to avoid KV eviction; set false to enable) ──
 
 - id: delegation
   name: cordis:group
   group: true
+  disabled: true
   isolate:
     workflowEngine: true
   config:
@@ -190,6 +206,7 @@
 
 - id: tool-web
   name: '@deepseek-ai/dsh-tool-web'
+  disabled: true
   config:
     fetch: false
     searchTimeoutMs: 60000

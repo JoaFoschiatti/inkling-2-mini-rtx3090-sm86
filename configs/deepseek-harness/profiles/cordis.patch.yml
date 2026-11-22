@@ -1,4 +1,4 @@
-# Local RTX 3090 128K optimizations (Wave 10)
+# Local RTX 3090 128K optimizations (Wave 10 + Inkling-2-Mini Harness Tuning)
 - id: agent-presets
   config:
     default: inkling-128k
@@ -6,3 +6,8 @@
 - id: spill-policy
   config:
     maxInlineBytes: 24000
+    toolMaxInlineBytes:
+      bash: 12000
+      grep: 12000
+      glob: 8000
+      read: 28000
