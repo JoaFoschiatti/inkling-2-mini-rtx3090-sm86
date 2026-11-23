@@ -10,13 +10,13 @@
 
 > **De `55.5 t/s @ 32K` a `131–165 t/s` en programación agéntica multi-turno real, `114–125 t/s` a 118K de contexto y `96.7 %` de KV cache hit sostenido (`0` rollbacks BPE en sesiones de 107 pasos y 29 imágenes) en una única RTX 3090 de consumo (24 GB, 265 W) — con cero pérdida de precisión y decodificación especulativa probabilística exacta de Leviathan et al.**
 
-Este repositorio reúne **~20,150 líneas de kernels CUDA Ampere SM 8.6 e ingeniería de motor de inferencia C++ (Waves 1–13)** desarrolladas sobre [`unslothai/llama.cpp`](https://github.com/unslothai/llama.cpp) (`pr390` @ `8aa2f23`), junto con el stack de producción completo a **128K** (`inkling-proxy.mjs`, `fast-mcp.mjs`, plantilla Jinja $O(1)$) para **[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** (`UD-Q4_K_XL`, arquitectura *looped-transformer* + MoE NVFP4 de 128 expertos + atención híbrida SWA/global + drafter DSpark + proyector de visión).
+Este repositorio reúne **~20,600 líneas de kernels CUDA Ampere SM 8.6 e ingeniería de motor de inferencia C++ (Waves 1–14)** desarrolladas sobre [`unslothai/llama.cpp`](https://github.com/unslothai/llama.cpp) (pull request #390 @ `8aa2f23`), junto con el stack de producción completo a **128K** (`inkling-proxy.mjs`, `fast-mcp.mjs`, plantilla Jinja $O(1)$) para **[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** (`UD-Q4_K_XL`, arquitectura *looped-transformer* + MoE NVFP4 de 128 expertos + atención híbrida SWA/global + drafter DSpark + proyector de visión).
 
 ---
 
 ## Hardware y Entorno de Pruebas (Importante para Reproducir)
 
-Todos los benchmarks de este repositorio (tanto el **baseline stock** como las **Waves 1–13**) se midieron en la misma máquina:
+Todos los benchmarks de este repositorio (tanto el **baseline stock** como las **Waves 1–14**) se midieron en la misma máquina:
 - **GPU**: Gigabyte NVIDIA GeForce RTX 3090 (24 GB GDDR6X, Ampere SM 8.6), con tope térmico de **280 W** en Waves 8–12 y **265 W (`-lgc 210,1800`)** desde Wave 13 (`nvidia-power-cap.service`, estable en `75–77 °C` sostenidos).
 - **Driver / SO**: Linux `x86_64`, NVIDIA Open Kernel Module `595.99.02`.
 - **Desbloqueo de Tensor Cores**: **[Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock) v2.0.0** activo desde el arranque (`SS0=0x88888888`, `SS1=0x8` — tasa completa `1:1` en Tensor Cores `FP16/BF16/TF32` con acumulador `FP32`).
@@ -44,7 +44,7 @@ Todos los benchmarks de este repositorio (tanto el **baseline stock** como las *
 
 ---
 
-## Evolución Wave por Wave (1 → 13)
+## Evolución Wave por Wave (1 → 14)
 
 | Wave | Hito de Ingeniería | Antes → Después (medido en RTX 3090) |
 | :--- | :--- | :--- |
@@ -58,6 +58,7 @@ Todos los benchmarks de este repositorio (tanto el **baseline stock** como las *
 | **Wave 11 (Zero-D2H Spec + Prefill Split-K)** | ***Rejection sampling* Leviathan en GPU sin D2H** (`0 B` `q_probs` por PCIe, `16 B` resultado), **softmax DSpark fusionado + `draft_min_p` + CDF exacto**, scheduler dual para grafos inject de DSpark, **FA prefill Tensor-Core Split-K (`T=9..256`)**, batching de checkpoints `n-4` | Elimina stalls de D2H en `q_probs` y triple partición de turnos cortos de herramientas |
 | **Wave 12 (Higiene CPU + Gate por Tasa)** | **Gate adaptativo por tasa medida** (`cycle` vs `plain`), **memoización de gramática GBNF y vocabulario**, skip de reserva de sampler, **bucle de decode de 1 hilo (`THREADS=1`)** | Menor carga CPU en host; conmutación `T=5↔T=1` más precisa sin regresión en código |
 | **Wave 13 + Stack Agéntico de Producción** | **`base64_decode` LUT 256 B + `data:` URI zero-copy**, **caché incremental lossless de prefijo + tokens generados + LRU de 48 imágenes** con hidratación en rollback, `media_min_gap=2048` en `wave10d`, plantilla Jinja $O(1)$, **`inkling-proxy.mjs`** (compactación con KV-hit + `budget=0`, `bash_high_effort`, `low_cap_escalate`, `loop_rescue`), **`fast-mcp.mjs` v2** (`read_batch`, PNG lossless, cache deshabilitado, pausa `rAF` reversible + autocierre 10 min, `mobile: true` 390×844), tope **`265 W`** | Sesión real 107 pasos / 29 PNGs: **`96.67 %` KV hit**, **`102/102` `f_keep=1.000` (0 rollbacks BPE)**, 4 compactaciones **`94.9–97.6 %` KV hit (`10.9 s` vs `736 s`)**, `preCPU` **`164.2 → 22.9 s`**, Chrome idle **`1,071 % → 0.2 %` CPU**, **`0` swap**, **`75–77 °C`** |
+| **Wave 14 (Corrección, Determinismo y Longitud de Borrador)** | **Carrera de memoria compartida corregida en los dos kernels de atención `mma.sync` por lotes** (la cola de `s_VT[w]` pisaba el inicio de `s_K[w+1]`), que hacía no determinista el decode por lotes; cabeza low-rank de DSpark en FP32 real (el handle de cuBLAS estaba en modo TF32); ~20 arreglos latentes (estado de kernels por contexto, ruta `W6_NO_KVFUSE`, logits diferidos, reuso de grafos, firma del sampler, memo de GBNF, checkpoints de generación sin especulación); **RPATH `$ORIGIN`** (cada carpeta de binarios carga sus propias librerías); **planificador propio para el paso de 1 token** (`sched_t1`); **borradores de 3 tokens por defecto** (`T=4`) | `inkcheck --decode-batch 5`: **`17/93` corridas desviadas → `0/112`**; servidor a `temp 0` con especulación siempre activa: **`7` y `5` salidas distintas en 8 corridas → `1` y `1`**; decode de 1 token bit a bit igual que Wave 13; paso simple **`-1.1 %`**, turnos cortos encadenados **`-1.7 %`**; longitud 3 contra 4: **`+3.3 %` código nuevo, `+3.0 %` razonamiento, `+4.7 %` tool calls, `-4.1 %` de tiempo en turnos cortos encadenados, `-4.0 %` reescritura literal**; `tools/validate.sh`: KLD `5.29e-3` (piso de ruido `4.03e-3`), top-1 `98.44 %`, `z = -0.52` |
 
 Documentación técnica detallada → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · Tablas completas de benchmarks y precisión → [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
 
@@ -66,17 +67,19 @@ Documentación técnica detallada → [docs/ARCHITECTURE.md](docs/ARCHITECTURE.m
 ## Reproducción rápida (RTX 3090 / Ampere SM 8.6)
 
 ```bash
-# 1. Clonar unslothai/llama.cpp@8aa2f23, aplicar el parche Wave 13 y compilar SM 8.6
+# 1. Traer unslothai/llama.cpp@8aa2f23 (cabeza de su pull request #390), aplicar el parche Wave 14 y compilar SM 8.6
 ./patches/apply-and-build.sh
 
 # 2. Colocar los pesos GGUF en models/ y fijar el tope térmico de 265 W
 sudo ./scripts/gpu-power-cap.sh 265
 
-# 3. Iniciar el servidor 128K Wave 13 (+ proxy adaptativo opcional en :8081) y verificar 5/5 endpoints
+# 3. Iniciar el servidor 128K Wave 14 (+ proxy adaptativo opcional en :8081) y verificar 5/5 endpoints
 ./scripts/start-server.sh
 ./configs/deepseek-harness/tools/inkling-proxy.mjs &
 python3 tools/server-smoke.py 8080
 ```
+
+El lanzador usa por defecto borradores de 3 tokens (`DSPARK_N=3 NGRAM_MIN=3 NGRAM_MAX=3`); conviene poner los tres en 4 si el uso es sobre todo copiar texto literal. Para salidas reproducibles a `temp 0`: `W10_NO_ADAPT_SPEC=1` (la puerta adaptativa decide con tiempos medidos). `patches/apply-and-build.sh` nunca resetea un árbol de fuentes con otros cambios locales; para recompilar desde cero hay que darle un `SRC_DIR` nuevo.
 
 > **Nota para reproducir los números de prefill y MMA en 64K–128K**: todas las mediciones de este repo se ejecutaron con **[Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock) v2.0.0** activo (`SS0=0x88888888`, `SS1=0x8`). Sin ese módulo, el decode `T=1` casi no cambia, pero el prefill y el kernel `mma.sync.m16n8k16` (`FP16→FP32`) de atención a contexto largo correrán a la ½ tasa de fábrica de GeForce.
 

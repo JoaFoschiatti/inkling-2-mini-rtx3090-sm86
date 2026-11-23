@@ -1,6 +1,6 @@
 # Technical Architecture & Optimization Deep-Dive
 
-This document details the CUDA kernel engineering, inference runtime changes, mathematical proofs, and multi-turn KV-cache systems work implemented across **Waves 1–13** for **Inkling-2-Mini** on **NVIDIA Ampere SM 8.6 (RTX 3090, 24 GB)**.
+This document details the CUDA kernel engineering, inference runtime changes, mathematical proofs, and multi-turn KV-cache systems work implemented across **Waves 1–14** for **Inkling-2-Mini** on **NVIDIA Ampere SM 8.6 (RTX 3090, 24 GB)**.
 
 ---
 
@@ -23,7 +23,7 @@ Unmodified `llama.cpp` (`pr390`) ran at only **55–59 t/s** because:
 
 ## 2. CUDA Kernel Engineering (`ggml/src/ggml-cuda/inkling-fused.cuh`)
 
-All custom kernels live in [kernels/inkling-fused.cuh](../kernels/inkling-fused.cuh) (8,012 lines) and graph matchers in `ggml/src/ggml-cuda/ggml-cuda.cu`, with runtime A/B debug toggles (`W6_NO_*`, `W7_NO_*`, `W8_NO_*`, `W9_NO_*`, `W10_NO_*`) for isolated verification.
+All custom kernels live in [kernels/inkling-fused.cuh](../kernels/inkling-fused.cuh) (9,332 lines) and graph matchers in `ggml/src/ggml-cuda/ggml-cuda.cu`, with runtime A/B debug toggles (`W6_NO_*` … `W14_NO_*`) for isolated verification.
 
 ### Waves 1–6: Single-Token Decode Compression (`~5,000+ → 816 ops/tok`)
 - **Branchless NVFP4 dequant (`common.cuh`, `vecdotq.cuh`, `mmvq.cu`)**: 5-instruction bit-manipulation `UE4M3 → FP32` for SM < 89 + vectorized `__ldg` `uint16_t` paired-scale loads + 8-warp `mul_mat_vec_q_nvfp4_nosync_1` without `__syncthreads()` or shared memory (`688–743 GB/s`).
@@ -138,3 +138,52 @@ Driven by a 50.7-minute forensic production audit (`450` requests / `22` screens
   - Detects `dsh` compactions by header or prompt marker, **preserves the session's active `reasoning_effort`** even when `dsh` explicitly sends `"none"` (raising compaction KV cache hit from **`0 % → 94.9–97.6 %`**), and sets `reasoning_budget_tokens = 0`.
   - Keeps full `HIGH_BUDGET = 12288` after `bash` in `high`/`xhigh`/`max` (`bash_high_effort`), auto-escalates after any low-budget cap hit (`low_cap_escalate`), and triggers `loop_rescue` (`presence_penalty = 0.4`, `HIGH_BUDGET`) on repeated identical tool calls.
 - **`fast-mcp.mjs` v2 ([configs/deepseek-harness/tools/fast-mcp.mjs](../configs/deepseek-harness/tools/fast-mcp.mjs))**: Adds `mcp__fast__read_batch` (multi-file/range batched reads), defaults to lossless PNG screenshots, disables HTTP cache (`Network.setCacheDisabled(true)`) + honors `reload: true` on same URL, installs a reversible `requestAnimationFrame` pause hook via `Page.addScriptToEvaluateOnNewDocument` + 10-min idle auto-close (dropping idle headless Chrome from `468–1,071 % CPU` to **`0.1–0.2 % CPU`**), reports SwiftShader software WebGL honestly on `<canvas>`, supports `duration_ms` alias, and sets `390×844` on `mobile: true`.
+
+---
+
+## 5. Wave 14: Correctness, Determinism & Speculation Economics
+
+Wave 14 started as the validation of an external review (~45 claims: suspected bugs and proposed optimizations) against the code and, wherever a claim depended on hardware behaviour, against the GPU itself. It does not change the arithmetic of the 1-token path (logits bit-identical to Wave 13 over 1,024 tokens). It fixes one real non-determinism bug in batched decode and about twenty latent bugs, and it re-measures what speculation costs. Tables: [BENCHMARKS.md §4D](BENCHMARKS.md#4d-wave-14--determinism-draft-length--per-step-costs-265-w).
+
+### 5.1 The Batched-Attention Shared-Memory Race
+Batched decode (`T = 2..24`) was not reproducible from run to run: `inkcheck --decode-batch 5` deviated in 17 of 93 runs. The cause was not the L1 cache (the review's hypothesis) but a shared-memory overlap in the two `mma.sync` attention kernels that run without a block-level barrier, `inkling_rel_pos_fattn_batched_mma_kpos` (`T = 2..8`) and `inkling_rel_pos_fattn_batched_mma_dyn_kpos` (`T = 9..24`). Their per-warp scratch is a union of `s_K[4][16][136]` (4,352 B per warp) and `s_VT[4][128][18]` (4,608 B per warp), so the tail of `s_VT[w]` overlapped the head of `s_K[w+1]`, and the KV loop only synchronizes with `__syncwarp()`. The fix is one padding row, `s_K[4][17][136]`; the 136-element stride that avoids bank conflicts is unchanged.
+
+After the fix `inkcheck --decode-batch 5` gives 0 deviating runs in 112 and `--decode-batch 12` 0 in 36, and the server at `temp 0` with speculation always on gives one output per prompt (it gave 7 and 5 distinct outputs in 8 runs). `bit-exact` between two runs is therefore a valid acceptance test for batches of 2–24 tokens too, not only for `T = 1`.
+
+The server with its default configuration is still not reproducible at `temp 0`, for a different reason: the Wave 12 rate gate decides when to speculate from measured wall-clock rates, and the `T = 1` and batched paths differ within the int8-activation noise floor. `W10_NO_ADAPT_SPEC=1` (speculation always on) gives reproducible outputs.
+
+### 5.2 Latent Bugs Fixed
+- **DSpark low-rank head in true FP32**: `M = W_out @ H` was computed through a cuBLAS handle left in TF32 mode (relative error `2.97e-4`); it now uses `CUBLAS_COMPUTE_32F_PEDANTIC` (`6.0e-7`, [tools/microbench/tf32.cu](../tools/microbench/tf32.cu)). The cache also handed out a pointer into a `std::vector` that could be reallocated. Only the drafter is affected: verification never trusted it.
+- **Per-context kernel state**: the Split-K counters and the persistent row-index slot were static per `(device, stream)` and shared by two contexts of the same device; they now belong to the CUDA backend context and are freed in its destructor.
+- **`W6_NO_KVFUSE` A/B path**: with K/V fusion disabled, the `GET_ROWS[19968x1]` node folded away by Wave 7C was needed again but never materialized (KLD `0.29`, top-1 `87.5 %`). It is now materialized from the persistent index right before the unfused consumer, and the path is bit-identical to `W7_NO_SKIP_GET_ROWS=1`.
+- **Graph matchers**: the full MoE matcher rejects a `down` destination that aliases `ids`/`weights` at `T = 1`; `flash_attn_ext_supported` checks tensor pointers and types.
+- **Which scheduler owns the outputs** (`llama-context.cpp`): the graph callback pins tensors on the scheduler that runs the graph (it always used the main one, also for inject graphs); deferred logits and probabilities stay on the device only for the last ubatch of a batch, and `draft_step()`, `encode()` and `graph_reserve()` bring them to the host before the graph is invalidated.
+- **Sampler chain signature**: it includes the node count of the sampling graph; `need_logits` no longer depends on `need_probs`; a failed `set_sampler` clears the flags.
+- **Graph reuse**: `allow_reuse()` compares the output pattern of ubatches with partial outputs; the `DRAFT_HEAD` graph is rebuilt when its softmax changes.
+- **GBNF**: the whitespace mode of the forced-prefix drafter is read before the loop and is explicit (`W14_GBNF_WS_MODE`); the grammar memo is created with the grammar (clones always share it) and evicts its least-used entry instead of clearing itself at 64 entries.
+- **CPU sampling fast path**: the greedy shortcut requires a chain that really is an argmax (no logit bias, no model-suppressed tokens, no `dynatemp`, `infill` or `adaptive_p`); `common_sampler_get_candidates` no longer reads `data[-1]`; the host rejection path stops at EOG and bounds its copy to the drafter vocabulary.
+- **DSpark drafter**: the draft seed is reset per request; missing anchor features skip the draft of that step instead of throwing (HTTP 500).
+- **Server**: generation checkpoints (Wave 10B) are also taken without speculation; `__verbose.prompt` works on the OpenAI endpoints; `destroy()` purges the Wave 13 caches; the tokenization cache disables itself when the tokenizer does not split cleanly at control tokens (self-test once per vocabulary).
+- **Library loading**: `$ORIGIN` reached the linker empty, which left the current directory first in the search path and the build tree ahead of `LD_LIBRARY_PATH`, so `bin-sm86/` was really running the libraries of the build tree. The RPATH now goes through CMake (`CMAKE_BUILD_WITH_INSTALL_RPATH=ON`, `CMAKE_INSTALL_RPATH=$ORIGIN`): each binary folder loads its own libraries, and deploying means copying.
+
+### 5.3 Review Claims That Did Not Hold
+Measured rather than argued, with probes in [tools/microbench/](../tools/microbench/):
+- *Stale L1 reads in the Split-K kernels.* The L1 of the RTX 3090 is indeed incoherent across SMs (93 % stale reads in a probe without a fence), but `__threadfence()` flushes it at SM level (0 %, even when another warp executes it) and the last block always executes it before reading: 0 stale reads in 400,000 launches seeded with stale lines (`l1_probe.cu`, `l1_stale.cu`). `atomicAdd` alone does not flush it.
+- *`return` before `__syncthreads()` hangs the GPU.* 14,000 launches with whole warps leaving before the barrier: no hang (`sync_exit.cu`).
+- *Out-of-bounds `params_ptr[8..9]` in the fused DSpark sample*, *stacked-drafter crash at `block_size = 5`*, *fusions dropped at `T = 5`*: the matcher validates 16 floats, the GGUF `block_size` is 8 with GBNF capped at 7, and the `T = 5` profile shows MoE, horizontal GEMV, `wo` and K/V fused in 48 of 48 layers.
+
+### 5.4 A Scheduler for the Plain Step (`sched_t1`)
+A `ggml_backend_sched` holds one allocated graph. The target context alternates between the plain 1-token step (rate gate paused) and verification batches, and every switch rebuilt the graph and re-captured its CUDA graph: `7.0 + 3.6 ms` entering a pause and `6.9 + 2.1 ms` leaving it, ~20 ms per pause, ~3 pauses per 400-token request and 19 in a 2,400-token generation.
+
+Wave 14 gives the plain step of a speculation target its own scheduler and graph arena (`W14_NO_T1_SCHED=1` disables it), next to the Wave 11 inject scheduler, and every reader of output tensors asks the scheduler that ran the last ubatch (`sched_last()`). One rebuild per request remains (~12 ms), because the graph is bound to the sampler object of that request. It costs 14 MiB of VRAM and outputs are identical with and without it. Gain: `-1.1 %` per plain step, `-0.7 %` per cycle, `-1.7 %` on chained short turns.
+
+### 5.5 Draft Length: 3 Tokens by Default
+With device-resident rejection sampling a verification row is cheap but not free. Measured with `W12_SPEC_STATS=1`: a cycle with 4 drafts costs `24.75 ms` and yields `2.80` tokens, a cycle with 3 drafts `22.10 ms` and `2.54` tokens, and a plain step `9.8 ms`. The 4th position buys `0.26` tokens for `2.65 ms`, which is `98 t/s` at the margin against `102 t/s` for a plain step: at `temp 1.0` it is a net loss when the drafter has to predict new code, reasoning or tool calls, and it only pays when the drafter is copying text.
+
+Since 2026-11-23 the default is therefore 3 drafts per cycle (`T = 4` verification): `DSPARK_N=3`, `NGRAM_MIN=3`, `NGRAM_MAX=3`. Against 4 drafts that measures `+3.3 %` on new code, `+3.0 %` on reasoning, `+4.7 %` on tool calls, `-4.1 %` of wall time on chained short turns and `-4.0 %` on verbatim rewriting. Setting the three back to 4 restores the previous shape for workloads that mostly copy text. The three drafters must share one length: mixed lengths alternate batch shapes, and every change of shape rebuilds the verification graph (~8 ms), which measured far worse than either fixed length.
+
+### 5.6 Measured and Not Shipped
+- **Adaptive draft length** (3 or 4 from a moving average of per-position acceptance, two versions): `+2 %` on code and `-5` to `-7 %` on rewriting. The controller spends part of the gain on the ~60 tokens it needs to decide and on two graph rebuilds per request.
+- **Lazy grammar through the GPU rejection path** (saves a 1.6 MB device-to-host copy per rejection): the cycle costs `28.07 ms` with it and `27.89 ms` without.
+- **Strict GBNF whitespace prefix**: `96.5 ± 0.8 t/s` against `100.9 ± 2.0 t/s` for the compact mode on `json_schema` output; the compact mode stays the default, now explicitly.
+- **Draft injection during prefill**: `11 + 1.8 ms` per 512-token batch against `280–295 ms` of the target model (4 %): no margin worth the change.

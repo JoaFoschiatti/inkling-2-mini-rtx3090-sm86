@@ -1,10 +1,10 @@
 # Verified Benchmarks & Accuracy Validation
 
-All measurements (both stock baselines and Waves 1–13) were collected on the same **Gigabyte NVIDIA GeForce RTX 3090 (24 GB GDDR6X, Ampere SM 8.6)** system running Linux (`x86_64`, NVIDIA Open Kernel Module `595.99.02`), serving `Inkling-2-Mini-UD-Q4_K_XL.gguf` (16.41 GiB) + `dspark-Inkling-2-Mini-Q8_0.gguf` (384 MiB) + `mmproj-F16.gguf` (610 MiB, GPU offload from Wave 10D onward).
+All measurements (both stock baselines and Waves 1–14) were collected on the same **Gigabyte NVIDIA GeForce RTX 3090 (24 GB GDDR6X, Ampere SM 8.6)** system running Linux (`x86_64`, NVIDIA Open Kernel Module `595.99.02`), serving `Inkling-2-Mini-UD-Q4_K_XL.gguf` (16.41 GiB) + `dspark-Inkling-2-Mini-Q8_0.gguf` (384 MiB) + `mmproj-F16.gguf` (610 MiB, GPU offload from Wave 10D onward).
 
 > **Environment disclosures (important for reproduction)**:
 > 1. **Tensor Core Unlock — [Zagitta/gpu-unlock](https://github.com/Zagitta/gpu-unlock) v2.0.0 active at boot** (`SS0=0x88888888`, `SS1=0x8`, unlocking full-rate `FP16/BF16/TF32 → FP32` Tensor Core throughput on GeForce RTX 3090). Both the baseline reference and Waves 1–10 ran with `gpu-unlock` enabled. On a stock GeForce RTX 3090 **without** `gpu-unlock`, memory-bound `T=1` decode and `NVFP4`/`Q8_0` `dp4a` kernels perform nearly identically, whereas **prompt prefill (`pp512`, 32K–128K)** and **Wave 9B `mma.sync.m16n8k16` (`FP16→FP32`) Split-K Flash Attention (`T=2..8` at 64K–128K)** will exhibit lower absolute throughput due to NVIDIA's stock half-rate FP32-accumulation cap.
-> 2. **Thermal methodology**: Stock 370 W runs reach 83–87 °C in ~20 s and hit continuous thermal throttling (~108 t/s sustained). Starting in **Wave 8**, all benchmarks and production runs use a persistent **280 W power cap** (`nvidia-power-cap.service`), holding **≤ 80–82 °C** with **0 % HW thermal throttling (`0x40`)**.
+> 2. **Thermal methodology**: Stock 370 W runs reach 83–87 °C in ~20 s and hit continuous thermal throttling (~108 t/s sustained). Starting in **Wave 8**, all benchmarks and production runs use a persistent **280 W power cap** (`nvidia-power-cap.service`), holding **≤ 80–82 °C** with **0 % HW thermal throttling (`0x40`)**. From **Wave 13** the cap is **265 W** (`-lgc 210,1800`, `75–77 °C`); figures measured at 280 W and at 265 W are not comparable with each other.
 
 ---
 
@@ -150,6 +150,88 @@ Three complete real-world multi-turn frontend/SVG/WebGL coding sessions on RTX 3
 
 ---
 
+## 4D. Wave 14 — Determinism, Draft Length & Per-Step Costs (265 W)
+
+Protocol for every throughput table in this section: [`tools/gen-bench.py`](../tools/gen-bench.py) against `llama-server` with the production configuration, ~14K tokens of context, `temp = 1.0`, 400 generated tokens per request, four regimes (new code, reasoning, tool call, verbatim rewrite), the same seeds for every variant and the variants interleaved in blocks. `±` is the standard error of the mean.
+
+> Under the 265 W cap the absolute level of one binary moves ~10 % with the thermal state of the card (the same binary gave `92.2` and `97.8 t/s` on code in two halves of one session). Only interleaved comparisons are meaningful, and a gain below ~3 % cannot be shown in t/s with 16 seeds: it has to be shown by mechanism (ms per step, graph rebuilds) and by equality of outputs.
+
+### Determinism of batched decode (shared-memory race in the batched `mma.sync` attention kernels)
+| Test | Wave 13 | **Wave 14** |
+| :--- | ---: | ---: |
+| `inkcheck --decode-batch 5`, 12 batches per run | `17 / 93` runs deviate | **`0 / 112`** (and the output is the majority one from before) |
+| `inkcheck --decode-batch 12` (`dyn` kernel, `T = 9..24`) | `3 / 15` | **`0 / 36`** |
+| Server, `temp 0`, 400 tokens, speculation always on (`W10_NO_ADAPT_SPEC=1`), 8 runs per prompt | `7` and `5` distinct outputs | **`1` and `1`** |
+| 1-token decode over 1,024 tokens, Wave 14 vs Wave 13 binary | — | **`bit-exact: YES`** |
+
+### Throughput before and after the fixes (same seeds, binaries interleaved)
+| Case | Wave 13 binary | **Wave 14** |
+| :--- | ---: | ---: |
+| New code (8 seeds) | `97.8 t/s` | `104.0 t/s` |
+| Reasoning (8) | `95.9 t/s` | `96.5 t/s` |
+| Tool call (8) | `104.9 t/s` | `108.4 t/s` |
+| Verbatim rewrite (24) | `115.8 ± 2.4 t/s` | `116.9 ± 2.5 t/s` |
+| `json_schema` output (24) | `106.5 t/s` | `107.1 t/s` |
+| Plain step / cycle with 4 drafts | `10.19 / 25.95 ms` | `10.26 / 25.66 ms` |
+
+No measurable change, as expected from fixes that do not touch the cost per step (`±2–4 t/s` with 8 seeds).
+
+### Scheduler for the plain step (`sched_t1`; `W14_NO_T1_SCHED=1` disables it)
+| Metric | Without | **With** |
+| :--- | ---: | ---: |
+| Rebuilds of the 1-token graph in 4 requests | `14` | **`5`** (one per request remains) |
+| Plain step / cycle with 4 drafts (mean of 16 paired comparisons) | — | **`-0.11 ms` (`-1.1 %`) / `-0.19 ms` (`-0.7 %`)** |
+| 14 chained short turns ([`tools/turn-bench.py`](../tools/turn-bench.py)) | `4,457 ms` | **`4,382 ms` (`-1.7 %`)** |
+| New code / reasoning / tool call / rewrite, 32 seeds | `100.3 ± 1.7` / `94.3 ± 0.7` / `103.2 ± 1.1` / `131.8 ± 2.9 t/s` | `102.4 ± 1.7` / `95.7 ± 0.9` / `103.9 ± 1.5` / `130.7 ± 2.6 t/s` |
+
+Outputs are identical with and without it (same request at `temp 0` with forced pauses, 4 runs per prompt; same output hash in `turn-bench.py`). Cost of each batch-shape change it removes, from `[PROF_CTX]` over 4 requests:
+
+| Change of shape | Count | Build + allocate | First compute, extra | Total |
+| :--- | ---: | ---: | ---: | ---: |
+| To 1 token after a batch of 5 (entering a pause) | `12` | `7.0 ms` | `3.6 ms` | `10.6 ms` |
+| To 5 tokens after 1-token steps (leaving a pause) | `9` | `6.9 ms` | `2.1 ms` | `9.0 ms` |
+| To 5 tokens after a batch of 4 | `3` | `6.3 ms` | `1.8 ms` | `8.1 ms` |
+
+### Draft length (`DSPARK_N` = `NGRAM_MIN` = `NGRAM_MAX`)
+Final binary, 16 seeds per case (`701–716`; 32 for the rewrite, `701–732`) in interleaved blocks:
+
+| Variant | New code | Reasoning | Tool call | Verbatim rewrite |
+| :--- | ---: | ---: | ---: | ---: |
+| 4 drafts (`DSPARK_N=4`, n-gram `4..4`), the previous default | `105.2 ± 1.2` | `98.4 ± 0.9` | `107.3 ± 1.3` | `131.7 ± 2.8` |
+| **3 drafts (`DSPARK_N=3`, n-gram `3..3`), default since 2026-11-23** | **`108.6 ± 1.9`** | **`101.4 ± 0.8`** | **`112.4 ± 1.5`** | **`126.4 ± 2.3`** |
+| Difference | `+3.3 ± 2.2 %` | `+3.0 ± 1.3 %` | `+4.7 ± 1.9 %` | `-4.0 ± 2.7 %` |
+
+First session (before `sched_t1`, seeds `601–616`), including the variants that were discarded:
+
+| Variant | New code | Reasoning | Tool call | Verbatim rewrite |
+| :--- | ---: | ---: | ---: | ---: |
+| 4 drafts (32 samples) | `98.2 ± 1.0` | `94.2 ± 0.5` | `101.9 ± 0.9` | `137.1 ± 3.0` |
+| 3 drafts (16) | `105.1 ± 1.4` | `97.9 ± 1.0` | `107.3 ± 1.5` | `126.4 ± 3.1` |
+| 2 drafts (8) | `102.4 ± 1.6` | `96.8 ± 1.2` | `108.8 ± 1.5` | `120.9 ± 2.6` |
+| DSpark 2 with n-gram at 4: mixed batch shapes (8) | `97.6 ± 1.2` | `94.9 ± 0.9` | `95.3 ± 1.5` | `98.6 ± 2.4` |
+| Adaptive 3/4, state kept across requests (8) | `99.9 ± 1.4` | `98.2 ± 1.4` | `103.5 ± 1.6` | `130.3 ± 5.1` |
+| Adaptive 3/4, every request starts at 4 (8) | `100.1 ± 3.9` | `94.7 ± 1.4` | `105.6 ± 2.5` | `126.9 ± 5.8` |
+
+Chained short turns ([`tools/turn-bench.py`](../tools/turn-bench.py): 14 turns of 32 tokens on a cached ~14K context, `temp 0`, two interleaved passes per variant): `4,968` and `4,977 ms` with 4 drafts against **`4,769` and `4,764 ms` with 3 (`-4.1 %`)**, median generation per turn `283.6 → 261.6 ms`, and the same output hash in the four passes.
+
+Mechanism, from `W12_SPEC_STATS=1` over the 68 requests of each variant: a cycle with 4 drafts costs `24.75 ms` and yields `2.80` tokens (`113.1 t/s` while speculating), a cycle with 3 drafts `22.10 ms` and `2.54` tokens (`114.8 t/s`), and a plain step `9.8–9.9 ms` (`102 t/s`). The 4th position buys `0.26` tokens for `2.65 ms`, `98 t/s` at the margin: less than a plain step delivers, unless the drafter is copying text. With 3 drafts the rate gate also pauses less (31 % of the tokens are generated in pause, against 42 %). Across both sessions 3 drafts gain 3–7 % on new code, reasoning and tool calls and lose 4–8 % on verbatim rewriting.
+
+### Where the time goes (17.6K context, 265 W, ~76 °C)
+`INKLING_PROF_PREFILL=1 W12_PROF_ALL=1`; each figure includes the profiling sync.
+
+| Ubatch | ms |
+| :--- | ---: |
+| Plain step, 1 token (target model) | `10.03` |
+| 1-token inject into the drafter context | `0.39` |
+| 5-token verification | `22.44` |
+| DSpark draft (8 tokens, 4 outputs) | `2.77` |
+| 5-token inject | `0.55` |
+| 512-token prefill (target / inject) | `280–295` / `11 + 1.8` |
+
+A cycle with 4 drafts costs `27.0–28.0 ms` and a plain step `10.7–11.3 ms` (break-even ~2.5 tokens per cycle); with a cooler GPU, `25.0–25.9` and `9.3–10.3 ms`. In the `T = 5` graph the batched MoE is 51 % (`199 µs` per layer, already at the bandwidth limit for ~40 distinct experts), the horizontal GEMV 12 % and attention 7 %.
+
+---
+
 ## 5. Accuracy & Statistical Verification
 
 Because Inkling-2-Mini quantizes activations to `int8` (`Q8_1`) before every GEMV, even the unmodified `pr390` reference differs from itself between batch size 1 and batch size 512 (`KLD = 4.36e-3`, `top-1 = 97.17 %`, `z = -1.96`). All builds were validated with [`tools/inkcheck.cpp`](../tools/inkcheck.cpp) against this exact noise floor:
@@ -164,7 +246,11 @@ Because Inkling-2-Mini quantizes activations to `int8` (`Q8_1`) before every GEM
 | **Wave 9B `Q8_0` MMA vs F16 ref (`9K`, `T=5`, 64 decode)** | **`1.25e-3`** | **`100.00 %` (64/64)** | **`z = -1.28`** |
 | **Wave 9B `Q8_0` MMA vs F16 ref (`9K`, `T=8`, 64 decode)** | **`1.47e-3`** | **`100.00 %` (64/64)** | **`z = -1.16`** |
 | **Wave 9B `Q8_0` MMA vs F16 ref (`32K`, `T=5`, 64 decode)** | **`1.33e-3`** | **`100.00 %` (64/64)** | **`z = +1.03`** *(PPL `1.9259` vs `1.9444`)* |
+| Stock `pr390` ref vs itself, re-measured for Wave 14 (`1,024` tok, batch 1 vs 512 — *noise floor of that run*) | `4.03e-3` | `98.24 %` | `-0.0052 ± 0.0037` (`z = -1.38`) |
+| **`bin-sm86` Wave 14 vs stock ref (`tools/validate.sh`, `1,024` tok, `T=1`)** | **`5.29e-3`** | **`98.44 %`** | **`-0.0021 ± 0.0040` (`z = -0.52`)** |
 
 - **GPU vs CPU Sampler Equivalence (`tools/sampler-compare.py`)**: `4,000 / 4,000` (Wave 7) and `3,999 / 4,000` (`99.975 %`, Wave 8+) exact same token across seeds, passing chi-squared against exact CPU probabilities on all 4 test contexts.
 - **Deterministic Speculative Exactness (`temp=0.0`)**: `DSpark n=3/4 greedy`, `DSpark probabilistic` (auto-greedy at `temp=0`), and `ngram-mod n=7` produce **100 % token-for-token identical outputs** to baseline `T = 1`.
 - **Wave 7C `GET_ROWS` Fold**: `bit-exact: YES` (`1024/1024`, max diff `0.000e+00`).
+- **Wave 14**: 1-token decode `bit-exact: YES` against the Wave 13 binary over 1,024 tokens; GPU vs CPU sampler `4,000 / 4,000`; `tools/server-smoke.py` 5/5 on `bin-sm86`. The two Wave 14 rows above use this repository's `README.md` as the test text (what `tools/validate.sh` does on a clone); with the previous internal test text the same binaries gave KLD `6.57e-3`, top-1 `97.27 %`, `z = -1.43` against a floor of `5.38e-3`, `97.46 %`, `z = +0.09`.
+- **Scope of the `temp=0.0` exactness above (Wave 14 finding)**: until Wave 14 batched decode was not reproducible from run to run (§4D), and the `T = 1` and batched paths agree within the noise floor of the first rows of this table, not bit for bit, so a greedy speculative run can leave the `T = 1` output at a near-tie. From Wave 14 a batched run is reproducible; a reproducible server output at `temp 0` needs `W10_NO_ADAPT_SPEC=1`.
