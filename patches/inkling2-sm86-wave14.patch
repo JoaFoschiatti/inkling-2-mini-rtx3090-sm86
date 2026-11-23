@@ -1616,6 +1616,20 @@ index dc99975..ef0ae3a 100644
      // TODO: needs to be adapted to ggml_flash_attn_ext
      GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 2978340..877f6fa 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -482,6 +482,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+             return ggml_is_contiguous(op->src[0]);
+         case GGML_OP_SSM_SCAN:
+             return ggml_get_op_params_i32(op, 0) == 1 || op->src[3]->ne[0] == 1;
++        case GGML_OP_FLASH_ATTN_EXT:
++            // no rel pos attention on CPU
++            return op->src[6] == nullptr;
+         default:
+             return true;
+     }
 diff --git a/ggml/src/ggml-cuda/argmax.cu b/ggml/src/ggml-cuda/argmax.cu
 index 9be901e..8048bef 100644
 --- a/ggml/src/ggml-cuda/argmax.cu
@@ -1903,7 +1917,7 @@ index 053ed60..06e8b6f 100644
      // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
      // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 10aa5af..32b2c6a 100644
+index 10aa5af..aec2bf4 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -785,6 +785,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
@@ -1919,7 +1933,7 @@ index 10aa5af..32b2c6a 100644
      const ggml_tensor * Q = dst->src[0];
      const ggml_tensor * K = dst->src[1];
      const ggml_tensor * V = dst->src[2];
-@@ -836,5 +842,31 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -836,5 +842,32 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
  }
  
  bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
@@ -1940,6 +1954,7 @@ index 10aa5af..32b2c6a 100644
 +        }
 +        return cc >= GGML_CUDA_CC_AMPERE &&
 +               (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32) &&
++               mask->ne[2] == 1 && // the kernels read one mask for all heads
 +               sinks->type == GGML_TYPE_F32 && rel_bias->type == GGML_TYPE_F32 &&
 +               k_pos->type == GGML_TYPE_I32 && q_pos->type == GGML_TYPE_I32 &&
 +               Q->type == GGML_TYPE_F32 &&
@@ -17298,7 +17313,7 @@ index 5829d8e..402b954 100644
 +                           int32_t   max_tokens,
 +                              bool   space_after_punct);
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 269b920..fe1cceb 100644
+index 269b920..7a127f9 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -1413,10 +1413,14 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
@@ -17333,40 +17348,30 @@ index 269b920..fe1cceb 100644
      const int64_t n_rs = mctx->get_recr()->get_n_rs();
  
      if (inp_rs->s_copy) {
-@@ -1462,8 +1470,14 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+@@ -1462,6 +1470,11 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
  
      res &= can_reuse_kq_mask(inp_attn->self_attn_mask.raw, attn_ctx->get_base(), params.ubatch, params.cparams);
  
--    res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
--    res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
 +    const int64_t n_stream = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
 +    if (use_k_pos) {
 +        res &= self_k_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
 +        res &= self_k_pos->ne[1] == n_stream;
-+    } else {
-+        res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
-+        res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
 +    }
+     res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
+     res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
  
-     // swa tensors may not be allocated if there are no SWA attention layers
-     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
-@@ -1472,8 +1486,13 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+@@ -1472,6 +1485,10 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
  
      res &= can_reuse_kq_mask(inp_attn->self_attn_mask_swa.raw, attn_ctx->get_swa(), params.ubatch, params.cparams);
  
--    res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
--    res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 +    if (use_k_pos) {
 +        res &= self_k_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
 +        res &= self_k_pos_swa->ne[1] == n_stream;
-+    } else {
-+        res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
-+        res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 +    }
+     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
  
-     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
- 
-@@ -3181,7 +3200,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -3181,7 +3198,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
           ggml_tensor * v_mla,
               int64_t   n_kv_max,
                 float   kq_scale,
@@ -17376,7 +17381,7 @@ index 269b920..fe1cceb 100644
      const bool v_trans = v->nb[1] > v->nb[2];
  
      // split the batch into streams if needed
-@@ -3225,7 +3245,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -3225,7 +3243,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          }
          res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
  
@@ -17395,7 +17400,7 @@ index 269b920..fe1cceb 100644
          GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
          ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
          ggml_prec_set_acc(cur, GGML_PREC_F32);
-@@ -3780,7 +3810,10 @@ static ggml_tensor * build_attn_iswa_impl(
+@@ -3780,7 +3808,10 @@ static ggml_tensor * build_attn_iswa_impl(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
              float     kq_scale,
@@ -17407,7 +17412,7 @@ index 269b920..fe1cceb 100644
      ggml_context * ctx0 = gctx.ctx0;
      ggml_cgraph  * gf   = gctx.gf;
  
-@@ -3813,14 +3846,6 @@ static ggml_tensor * build_attn_iswa_impl(
+@@ -3813,14 +3844,6 @@ static ggml_tensor * build_attn_iswa_impl(
      // by doing so, the number of splits in the graph is reduced
      ggml_build_forward_expand(gf, q_cur);
  
@@ -17422,7 +17427,7 @@ index 269b920..fe1cceb 100644
      // whole seq fits into batch in training mode
      const bool use_kv_cur = cparams.training && k_cur && v_cur;
      if (use_kv_cur) {
-@@ -3829,24 +3854,33 @@ static ggml_tensor * build_attn_iswa_impl(
+@@ -3829,24 +3852,33 @@ static ggml_tensor * build_attn_iswa_impl(
  
      const bool store_kv = !use_kv_cur || hparams.n_layer_kv_from_start >= 0;
  
@@ -17466,7 +17471,7 @@ index 269b920..fe1cceb 100644
      cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
      gctx.cb(cur, "kqv_out", il);
  
-@@ -4274,12 +4308,13 @@ ggml_tensor * llm_graph_context::build_rs(
+@@ -4274,12 +4306,13 @@ ggml_tensor * llm_graph_context::build_rs(
                      get_state_rows);
  }
  
@@ -17482,7 +17487,7 @@ index 269b920..fe1cceb 100644
      const auto * mctx_cur = inp->mctx;
  
      const int64_t n        = conv_x->ne[0] - n_cols; // n_seq_tokens
-@@ -4299,8 +4334,11 @@ void llm_graph_context::build_conv_state_store(
+@@ -4299,8 +4332,11 @@ void llm_graph_context::build_conv_state_store(
                  n_cols*channels, n_seqs,
                  row_size, cell_offs);
  
@@ -17496,7 +17501,7 @@ index 269b920..fe1cceb 100644
      }
  
      // [TAG_RECURRENT_ROLLBACK_SPLITS]
-@@ -4332,7 +4370,11 @@ void llm_graph_context::build_conv_state_store(
+@@ -4332,7 +4368,11 @@ void llm_graph_context::build_conv_state_store(
              (size_t) mctx_cur->get_size()*row_size, ggml_row_size(s->type, n_cols), row_size,
              cell_offs);
  
@@ -17509,21 +17514,15 @@ index 269b920..fe1cceb 100644
  }
  
  ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
-@@ -4467,13 +4509,30 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
+@@ -4467,6 +4507,24 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
  
      auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
  
--    inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
--    ggml_set_input(inp->self_rel_pos);
--    ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
 +    // Wave 9A: when Flash Attention is active, pass compact k_pos [n_kv, n_stream] (~512 KB @ 128K)
 +    // directly into FLASH_ATTN_EXT instead of materializing [n_kv, T, 24] (~12 GiB @ 128K, -ub 512).
 +    const bool use_k_pos = cparams.flash_attn && (getenv("W9_NO_RELPOS_FA") == nullptr);
 +    inp->use_k_pos = use_k_pos;
- 
--    inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
--    ggml_set_input(inp->self_rel_pos_swa);
--    ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
++
 +    if (use_k_pos) {
 +        const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 +
@@ -17534,19 +17533,13 @@ index 269b920..fe1cceb 100644
 +        inp->self_k_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), n_stream);
 +        ggml_set_input(inp->self_k_pos_swa);
 +        ggml_set_name(inp->self_k_pos_swa, "attn_inp_k_pos_swa");
-+    } else {
-+        inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
-+        ggml_set_input(inp->self_rel_pos);
-+        ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
-+
-+        inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
-+        ggml_set_input(inp->self_rel_pos_swa);
-+        ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
 +    }
- 
-     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
- }
-@@ -4489,7 +4548,10 @@ ggml_tensor * llm_graph_context::build_attn(
++
++    // a layer can still take the dense path, a tensor that no layer uses gets no buffer
+     inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
+     ggml_set_input(inp->self_rel_pos);
+     ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
+@@ -4489,7 +4547,10 @@ ggml_tensor * llm_graph_context::build_attn(
          ggml_tensor * kq_b,
          ggml_tensor * sinks,
              float     kq_scale,
@@ -17558,7 +17551,7 @@ index 269b920..fe1cceb 100644
      const bool is_swa = hparams.is_swa(il);
  
      auto * inp_attn = inp->get_attn();
-@@ -4500,6 +4562,11 @@ ggml_tensor * llm_graph_context::build_attn(
+@@ -4500,6 +4561,11 @@ ggml_tensor * llm_graph_context::build_attn(
      //       needs a kv_rows flash attention with a per-head mask (CUDA has none)
      GGML_ASSERT(attn_mask.rows == nullptr);
  
@@ -17570,7 +17563,7 @@ index 269b920..fe1cceb 100644
      // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
      ggml_tensor * kq_mask = attn_mask.raw;
      if (kq_mask->type != GGML_TYPE_F32) {
-@@ -4511,7 +4578,7 @@ ggml_tensor * llm_graph_context::build_attn(
+@@ -4511,7 +4577,7 @@ ggml_tensor * llm_graph_context::build_attn(
      }
      cb(kq_mask, "kq_mask_rel_pos", il);
  
@@ -17579,7 +17572,7 @@ index 269b920..fe1cceb 100644
  }
  
  void llm_graph_context::build_dense_out(
-@@ -4649,6 +4716,7 @@ void llm_graph_context::build_logits() const {
+@@ -4649,6 +4715,7 @@ void llm_graph_context::build_logits() const {
  
      // the models declare t_logits without expanding it, so the LM head is computed only when it is expanded here
      if (res->t_logits != nullptr) {
@@ -18292,10 +18285,22 @@ index c79cd32..0303f98 100644
 +    res->t_logits = block_order(concat_tree(std::move(logit_cols)), n_logit_cols);
  }
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index 2fac5d7..018a3bd 100644
+index 2fac5d7..6e0aed3 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
-@@ -208,20 +208,24 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
+@@ -1,6 +1,11 @@
+ #include "models.h"
+ #include "../llama-memory-hybrid-iswa.h"
+ 
++// only the CUDA backend has the compact rel pos attention
++static bool dev_has_rel_pos_fattn(ggml_backend_dev_t dev) {
++    return dev && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") == 0;
++}
++
+ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
+@@ -208,20 +213,24 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
      return ggml_mul(ctx0, cur, ggml_clamp(ctx0, factor, 0.0f, 1.0f));
  }
  
@@ -18330,7 +18335,7 @@ index 2fac5d7..018a3bd 100644
  }
  
  // loop message controller: (1 - tanh(F h))*cur + tanh(G h)*message, h = D [rms(cur); rms(message)]; module: q, k, v, mlp
-@@ -245,29 +249,38 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+@@ -245,29 +254,38 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
          ggml_tensor * state,
          ggml_tensor * history,
          llm_graph_input_rs * inp,
@@ -18376,7 +18381,7 @@ index 2fac5d7..018a3bd 100644
              ggml_tensor * window = ggml_view_3d(ctx0, x, n_seq_tokens, n_channels, n_seqs, x->nb[1], x->nb[2], (n_conv - 1 - lag)*x->nb[0]);
  
              window = ggml_cont(ctx0, ggml_transpose(ctx0, window));
-@@ -279,7 +292,11 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+@@ -279,7 +297,11 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
          }
      }
  
@@ -18389,7 +18394,7 @@ index 2fac5d7..018a3bd 100644
  }
  
  llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
-@@ -303,14 +320,36 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+@@ -303,14 +325,36 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
      }
  
      std::vector<ggml_tensor *> blocks;
@@ -18428,7 +18433,7 @@ index 2fac5d7..018a3bd 100644
  
      for (int il = 0; il < n_layer; ++il) {
          const auto & layer = model.layers[il];
-@@ -323,30 +362,40 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+@@ -323,30 +367,40 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
  
              if (ip == (int) hparams.loop_core_start) {
                  if (pass == 0) {
@@ -18487,7 +18492,7 @@ index 2fac5d7..018a3bd 100644
              }
          }
  
-@@ -367,9 +416,17 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+@@ -367,9 +421,17 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
          // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
          ggml_tensor * inputs[3] = {cur, cur, cur};
          if (layer.attn_res_query) {
@@ -18508,7 +18513,7 @@ index 2fac5d7..018a3bd 100644
              }
          }
  
-@@ -379,6 +436,9 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+@@ -379,6 +441,9 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
                  inputs[j] = control(inputs[j], messages[j], layer, j);
              }
              cb(inputs[0], "loop_q_inp", il);
@@ -18518,7 +18523,7 @@ index 2fac5d7..018a3bd 100644
          }
  
          if (is_swa && messages[0]) {
-@@ -396,16 +456,39 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+@@ -396,16 +461,39 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
  
          // self-attention
          {
@@ -18568,7 +18573,7 @@ index 2fac5d7..018a3bd 100644
              Rcur = clip(ggml_reshape_3d(ctx0, Rcur, hparams.n_relative, n_head, n_tokens), layer.attn_rel_clip, hparams.f_relative_clip);
  
              if (!is_swa) {
-@@ -414,36 +497,61 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+@@ -414,36 +502,62 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
              }
  
              cb(Qcur, "Qcur", il);
@@ -18610,7 +18615,8 @@ index 2fac5d7..018a3bd 100644
 -            cur = build_attn(inp,
 -                    nullptr, nullptr, nullptr,
 -                    Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
-+            if (inp->use_k_pos && hparams.n_relative == 16 && n_embd_head == 128 && n_head == 24 && n_head_kv == 8) {
++            if (inp->use_k_pos && dev_has_rel_pos_fattn(model.dev_layer(il)) &&
++                    hparams.n_relative == 16 && n_embd_head == 128 && n_head == 24 && n_head_kv == 8) {
 +                // Wave 9A: pass compact RelPos tensors directly to FLASH_ATTN_EXT (0 GiB bias table!)
 +                llm_rel_pos_attn rpa;
 +                rpa.r_cur    = Rcur;
@@ -18654,7 +18660,7 @@ index 2fac5d7..018a3bd 100644
              cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
              cb(cur, "attn_out", il);
          }
-@@ -451,15 +559,18 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+@@ -451,15 +565,18 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
          // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks
          if (ip % hparams.attn_res_block_size == 0) {
              blocks.push_back(inpSA);
@@ -18674,7 +18680,7 @@ index 2fac5d7..018a3bd 100644
          if (messages[3]) {
              cur = control(cur, messages[3], layer, 3);
              cb(cur, "loop_ffn_inp", il);
-@@ -488,10 +599,11 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+@@ -488,10 +605,11 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
          cb(cur, "ffn_out", il);
  
          cur = ggml_add(ctx0, ffn_inp, cur);

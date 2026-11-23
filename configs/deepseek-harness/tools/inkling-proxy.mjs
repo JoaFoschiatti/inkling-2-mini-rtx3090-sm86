@@ -553,6 +553,8 @@ const server = http.createServer((req, res) => {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
   req.on("end", () => {
+    // Client already gone while the body was arriving: nothing to forward.
+    if (res.destroyed) return;
     const tStart = performance.now();
     let outBody = Buffer.concat(chunks);
     let decision = null;
@@ -622,6 +624,8 @@ const server = http.createServer((req, res) => {
     let lastTimings = null;
     let lastUsage = null;
     let nonStreamBuf = [];
+    let upstreamDone = false;
+    let clientGone = false;
 
     const upReq = http.request(
       {
@@ -672,6 +676,7 @@ const server = http.createServer((req, res) => {
         });
 
         upRes.on("end", () => {
+          upstreamDone = true;
           if (isChatCompletion) {
             const totalMs = performance.now() - tStart;
             if (!isStream && nonStreamBuf.length > 0) {
@@ -742,6 +747,8 @@ const server = http.createServer((req, res) => {
         });
 
         upRes.on("error", (err) => {
+          if (clientGone) return;
+          upstreamDone = true;
           if (!res.headersSent) {
             res.writeHead(502, { "content-type": "application/json" });
           }
@@ -752,13 +759,43 @@ const server = http.createServer((req, res) => {
 
     upReq.on("socket", (sock) => sock.setNoDelay(true));
     upReq.on("error", (err) => {
+      if (clientGone) return;
+      upstreamDone = true;
       if (!res.headersSent) {
         res.writeHead(502, { "content-type": "application/json" });
       }
       res.end(JSON.stringify({ error: { message: `Upstream connect error: ${err.message}` } }));
     });
 
-    req.on("aborted", () => upReq.destroy());
+    // Client disconnected before the response was complete (cancelled turn, closed
+    // tab, timeout): drop the upstream request too, so llama-server stops generating
+    // and frees its slot. The request body is fully read by now, so the old
+    // req "aborted" hook could never fire; the response "close" event does.
+    res.on("close", () => {
+      if (upstreamDone || res.writableFinished) return;
+      clientGone = true;
+      upReq.destroy();
+      if (isChatCompletion) {
+        appendTelemetry({
+          ts: new Date().toISOString(),
+          status: 499,
+          cancelled: true,
+          stream: isStream,
+          is_compact: decision?.isCompact ?? false,
+          effort: decision?.effort ?? null,
+          effort_injected: decision?.injectEffort ?? null,
+          loop_rescue: decision?.loopRescue ?? false,
+          n_images: nImages,
+          budget_reason: decision?.reason ?? "passthrough",
+          last_role: decision?.lastRole ?? "none",
+          last_tool: decision?.lastTool ?? "-",
+          budget: decision?.budget ?? null,
+          ttft_ms: tFirstToken !== null ? Number((tFirstToken - tStart).toFixed(2)) : null,
+          total_ms: Number((performance.now() - tStart).toFixed(2)),
+        });
+      }
+    });
+
     upReq.end(outBody);
   });
 });
