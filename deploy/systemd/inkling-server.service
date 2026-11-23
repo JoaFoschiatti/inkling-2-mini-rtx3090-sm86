@@ -1,5 +1,5 @@
 [Unit]
-Description=Inkling 2 Mini Local LLM Server (SM 8.6 Wave 13 CUDA · 128K)
+Description=Inkling 2 Mini Local LLM Server (SM 8.6 CUDA · 128K)
 After=network.target nvidia-power-cap.service
 Wants=nvidia-power-cap.service
 

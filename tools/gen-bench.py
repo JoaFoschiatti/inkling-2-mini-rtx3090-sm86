@@ -11,6 +11,7 @@ ap.add_argument("--ctx-file", default="")
 ap.add_argument("--ctx-chars", type=int, default=0)
 ap.add_argument("--label", default="")
 ap.add_argument("--json", default="")
+ap.add_argument("--with-tools", action="store_true", help="adjunta la herramienta a todos los casos (gramatica lazy sin disparar)")
 args = ap.parse_args()
 
 ctx = ""
@@ -66,8 +67,8 @@ def call(case):
     user = (("Documento de referencia:\n\n" + ctx + "\n\n") if ctx else "") + c["prompt"]
     payload = {"model": "inkling", "messages": [{"role": "user", "content": user}], "max_tokens": args.max_tokens, "stream": True,
                "temperature": args.temp, "seed": args.seed, "chat_template_kwargs": {"reasoning_effort": c["effort"]}}
-    if "tools" in c:
-        payload["tools"] = c["tools"]
+    if "tools" in c or args.with_tools:
+        payload["tools"] = c.get("tools", TOOLS)
     req = urllib.request.Request(f"http://127.0.0.1:{args.port}/v1/chat/completions", data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
     t0 = time.perf_counter(); timings = None
     with urllib.request.urlopen(req, timeout=900) as r:

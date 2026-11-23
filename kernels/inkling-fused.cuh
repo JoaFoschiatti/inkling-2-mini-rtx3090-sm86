@@ -3552,30 +3552,51 @@ static __global__ void inkling_fused_router_topk128_64blk(
     }
 }
 
-static inline int32_t * inkling_get_router_counter(const int device, const int stream_no) {
-    static int32_t * d_cnts[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
-    const int s = (stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS) ? stream_no : 0;
-    if (d_cnts[device][s] == nullptr) {
-        int32_t * ptr = nullptr;
-        CUDA_CHECK(cudaMalloc(&ptr, sizeof(int32_t)));
-        CUDA_CHECK(cudaMemset(ptr, 0, sizeof(int32_t)));
-        d_cnts[device][s] = ptr;
+// The counters and the row index slot belong to the context: two contexts on one device have their own streams,
+// so slots shared by (device, stream_no) would be written by both at the same time.
+static inline int32_t * inkling_get_ctx_slot(ggml_backend_cuda_context & ctx, const int kind, const size_t n) {
+    const int s = (ctx.curr_stream_no >= 0 && ctx.curr_stream_no < GGML_CUDA_MAX_STREAMS) ? ctx.curr_stream_no : 0;
+    int32_t *& slot = ctx.inkling_slots[kind][s];
+    if (slot == nullptr) {
+        CUDA_CHECK(cudaMalloc(&slot, n * sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(slot, 0, n * sizeof(int32_t)));
     }
-    return d_cnts[device][s];
+    return slot;
+}
+
+static inline int32_t * inkling_get_router_counter(ggml_backend_cuda_context & ctx) {
+    return inkling_get_ctx_slot(ctx, 0, 1);
+}
+
+static inline int32_t * inkling_get_fattn_counters(ggml_backend_cuda_context & ctx) {
+    return inkling_get_ctx_slot(ctx, 1, 1024);
 }
 
 // Persistent 4-byte GPU slot holding a safe copy of rs_s_copy[0] across the whole graph
 // (prevents ggml_gallocr reuse of rs_s_copy after the last skipped GET_ROWS from clobbering Layer 47!).
-static inline int32_t * inkling_get_rs_idx_slot(const int device, const int stream_no) {
-    static int32_t * d_slots[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
-    const int s = (stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS) ? stream_no : 0;
-    if (d_slots[device][s] == nullptr) {
-        int32_t * ptr = nullptr;
-        CUDA_CHECK(cudaMalloc(&ptr, sizeof(int32_t)));
-        CUDA_CHECK(cudaMemset(ptr, 0, sizeof(int32_t)));
-        d_slots[device][s] = ptr;
+static inline int32_t * inkling_get_rs_idx_slot(ggml_backend_cuda_context & ctx) {
+    return inkling_get_ctx_slot(ctx, 2, 1);
+}
+
+// One state row read through the persistent index slot. A GET_ROWS that was skipped and then needed after all
+// cannot run as the plain op: its index tensor may be reused by the allocator after the position of the node.
+static __global__ void inkling_get_state_row_f32(
+        const float * __restrict__ src,
+        const int32_t * __restrict__ row_idx,
+        float * __restrict__ dst,
+        const size_t row_stride_f,
+        const int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = src[(size_t) row_idx[0] * row_stride_f + i];
     }
-    return d_slots[device][s];
+}
+
+// Allocate the slots of the current stream before a stream capture starts.
+static inline void inkling_ensure_ctx_slots(ggml_backend_cuda_context & ctx) {
+    inkling_get_router_counter(ctx);
+    inkling_get_fattn_counters(ctx);
+    inkling_get_rs_idx_slot(ctx);
 }
 
 static inline void ggml_cuda_op_inkling_router_topk128(
@@ -3592,7 +3613,7 @@ static inline void ggml_cuda_op_inkling_router_topk128(
         const float scale_val) {
     const int D4 = (int) (w->ne[0] >> 2);
     ggml_cuda_pool_alloc<float> scratch(ctx.pool(), 256);
-    int32_t * d_cnt = inkling_get_router_counter(ctx.device, ctx.curr_stream_no);
+    int32_t * d_cnt = inkling_get_router_counter(ctx);
     inkling_fused_router_topk128_64blk<<<64, dim3(32, 4, 1), 0, ctx.stream()>>>(
         (const float4 *) w->data,
         (const float4 *) x->data,
@@ -4004,7 +4025,7 @@ static inline void ggml_cuda_op_inkling_moe_nvfp4_full(
     ggml_cuda_pool_alloc<float>      r_scratch(ctx.pool(), 256);
     ggml_cuda_pool_alloc<block_q8_1> y_q8_in(ctx.pool(), (size_t) (K / QK8_1));
     ggml_cuda_pool_alloc<block_q8_1> y_q8_mid(ctx.pool(), (size_t) n_exp_used * (n_ff / QK8_1));
-    int32_t * d_cnt = inkling_get_router_counter(ctx.device, ctx.curr_stream_no);
+    int32_t * d_cnt = inkling_get_router_counter(ctx);
 
     // Launch 1: 64 router blocks + ceil(K/256) idle-SM input pre-quantize blocks (73 blocks on 82 SMs!)
     const int n_qblks = (K + 255) / 256;
@@ -4088,7 +4109,7 @@ static inline void ggml_cuda_op_inkling_moe_q8_0_full(
     ggml_cuda_pool_alloc<float>      r_scratch(ctx.pool(), 256);
     ggml_cuda_pool_alloc<block_q8_1> y_q8_in(ctx.pool(), (size_t) nb_gu);
     ggml_cuda_pool_alloc<block_q8_1> y_q8_mid(ctx.pool(), (size_t) n_exp_used * nb_dn);
-    int32_t * d_cnt = inkling_get_router_counter(ctx.device, ctx.curr_stream_no);
+    int32_t * d_cnt = inkling_get_router_counter(ctx);
 
     const int n_qblks = (K + 255) / 256;
     inkling_fused_router_topk128_q8_73blk<false><<<64 + n_qblks, dim3(32, 4, 1), 0, stream>>>(
@@ -4482,18 +4503,6 @@ static __global__ void inkling_rel_pos_fattn_gqa3_cpasync_q8(
 #endif
 }
 
-static inline int32_t * inkling_get_fattn_counters(const int device, const int stream_no) {
-    static int32_t * d_cnts[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
-    const int s = (stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS) ? stream_no : 0;
-    if (d_cnts[device][s] == nullptr) {
-        int32_t * ptr = nullptr;
-        CUDA_CHECK(cudaMalloc(&ptr, 1024 * sizeof(int32_t)));
-        CUDA_CHECK(cudaMemset(ptr, 0, 1024 * sizeof(int32_t)));
-        d_cnts[device][s] = ptr;
-    }
-    return d_cnts[device][s];
-}
-
 static inline void ggml_cuda_op_inkling_rel_pos_fattn_wo(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * Q,
@@ -4546,7 +4555,7 @@ static inline void ggml_cuda_op_inkling_rel_pos_fattn_wo(
         scratch.alloc((size_t) 8 * MAX_SPLITS * 3 * 132);
         scratch_ptr = scratch.get();
     }
-    int32_t * d_cnt = inkling_get_fattn_counters(ctx.device, ctx.curr_stream_no);
+    int32_t * d_cnt = inkling_get_fattn_counters(ctx);
 
     const dim3 fa_grid(n_splits, 8, 1);
     const dim3 fa_block(32, 3, 1);
@@ -5410,7 +5419,7 @@ static inline void ggml_cuda_op_inkling_router_topk128_batched(
     const int ids_stride = (int) (ids->nb[1] / sizeof(int32_t));
     cudaStream_t stream = ctx.stream();
     ggml_cuda_pool_alloc<float> scratch(ctx.pool(), (size_t) 2 * T * 128);
-    int32_t * d_cnt = inkling_get_router_counter(ctx.device, ctx.curr_stream_no);
+    int32_t * d_cnt = inkling_get_router_counter(ctx);
     inkling_launch_router_batched<false, false>(
         (const float4 *) w->data, (const float4 *) x->data,
         bias ? (const float *) bias->data : nullptr,
@@ -5459,7 +5468,7 @@ static inline void ggml_cuda_op_inkling_moe_nvfp4_full_batched(
     ggml_cuda_pool_alloc<float>              mid_f32(ctx.pool(), (size_t) n_pairs * n_ff);
     ggml_cuda_pool_alloc<block_q8_1>         y_q8_mid(ctx.pool(), (size_t) n_pairs * (n_ff / QK8_1));
     ggml_cuda_pool_alloc<float>              dn_tmp(ctx.pool(), (size_t) n_pairs * nrows);
-    int32_t * d_cnt = inkling_get_router_counter(ctx.device, ctx.curr_stream_no);
+    int32_t * d_cnt = inkling_get_router_counter(ctx);
 
     // Launch 1: Batched Router + TopK128 + Pre-Interleaved Input Q8_1 Quantize
     const int n_qblks = (K + 255) / 256;
@@ -5563,7 +5572,7 @@ static inline void ggml_cuda_op_inkling_moe_q8_0_full_batched(
     ggml_cuda_pool_alloc<float>              mid_f32(ctx.pool(), (size_t) n_pairs * n_ff);
     ggml_cuda_pool_alloc<block_q8_1>         y_q8_mid(ctx.pool(), (size_t) n_pairs * nb_dn);
     ggml_cuda_pool_alloc<float>              dn_tmp(ctx.pool(), (size_t) n_pairs * nrows);
-    int32_t * d_cnt = inkling_get_router_counter(ctx.device, ctx.curr_stream_no);
+    int32_t * d_cnt = inkling_get_router_counter(ctx);
 
     const int n_qblks = (K + 255) / 256;
     inkling_launch_router_batched<false, true>(
@@ -5660,11 +5669,13 @@ struct inkling_dspark_lr_entry {
     float *      d_bout;
 };
 
-static inline const inkling_dspark_lr_entry * inkling_dspark_lr_get_or_build(
+// Copies the entry to out: a pointer into the cache does not survive the next build.
+static inline bool inkling_dspark_lr_get_or_build(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * w_out,
         const ggml_tensor * w_ho,
-        const ggml_tensor * b_ho) {
+        const ggml_tensor * b_ho,
+        inkling_dspark_lr_entry & out) {
     static std::mutex s_mtx;
     static std::vector<inkling_dspark_lr_entry> s_cache;
 
@@ -5678,7 +5689,8 @@ static inline const inkling_dspark_lr_entry * inkling_dspark_lr_get_or_build(
         for (const auto & e : s_cache) {
             if (e.device == dev && e.w_out == w_out->data && e.w_ho == w_ho->data && e.b_ho == b_ho->data &&
                     e.V_full == V_full && e.K == K && e.R == R) {
-                return &e;
+                out = e;
+                return true;
             }
         }
     }
@@ -5686,18 +5698,19 @@ static inline const inkling_dspark_lr_entry * inkling_dspark_lr_get_or_build(
     cudaStream_t stream = ctx.stream();
     cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
     if (cudaStreamIsCapturing(stream, &cap_status) != cudaSuccess || cap_status != cudaStreamCaptureStatusNone) {
-        return nullptr;
+        return false;
     }
 
     std::lock_guard<std::mutex> lock(s_mtx);
     for (const auto & e : s_cache) {
         if (e.device == dev && e.w_out == w_out->data && e.w_ho == w_ho->data && e.b_ho == b_ho->data &&
                 e.V_full == V_full && e.K == K && e.R == R) {
-            return &e;
+            out = e;
+            return true;
         }
     }
 
-    if (s_cache.size() >= 2) {
+    if (s_cache.size() >= 4) {
         int prev_dev = dev;
         if (s_cache.front().device != dev) {
             ggml_cuda_set_device(s_cache.front().device);
@@ -5713,11 +5726,11 @@ static inline const inkling_dspark_lr_entry * inkling_dspark_lr_get_or_build(
     half  * d_M    = nullptr;
     float * d_bout = nullptr;
     if (cudaMalloc(&d_M, (size_t) V_full * R * sizeof(half)) != cudaSuccess) {
-        return nullptr;
+        return false;
     }
     if (cudaMalloc(&d_bout, (size_t) V_full * sizeof(float)) != cudaSuccess) {
         cudaFree(d_M);
-        return nullptr;
+        return false;
     }
 
     constexpr int CHUNK_V = 4096;
@@ -5734,7 +5747,7 @@ static inline const inkling_dspark_lr_entry * inkling_dspark_lr_get_or_build(
         cudaFree(d_H_f32);
         cudaFree(d_bout);
         cudaFree(d_M);
-        return nullptr;
+        return false;
     }
 
     const float * H_ptr = nullptr;
@@ -5750,6 +5763,7 @@ static inline const inkling_dspark_lr_entry * inkling_dspark_lr_get_or_build(
         H_ptr = d_H_f32;
     }
 
+    // The handle is in TF32 math mode: only the PEDANTIC compute type gives a true FP32 GEMM (6e-7 vs 3e-4 relative error).
     cublasHandle_t cublas_h = ctx.cublas_handle();
     const float alpha = 1.0f;
     const float beta  = 0.0f;
@@ -5770,7 +5784,7 @@ static inline const inkling_dspark_lr_entry * inkling_dspark_lr_get_or_build(
             d_W_chunk, CUDA_R_32F, K,
             &beta,
             d_M_chunk, CUDA_R_32F, R,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
 
         const size_t n_m = (size_t) vc * R;
         inkling_f32_to_f16_elem<<<(unsigned) ((n_m + 255) / 256), 256, 0, stream>>>(
@@ -5785,7 +5799,7 @@ static inline const inkling_dspark_lr_entry * inkling_dspark_lr_get_or_build(
             b_ho->data, CUDA_R_32F, K,
             &beta,
             d_bout + v0, CUDA_R_32F, vc,
-            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+            CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -5794,7 +5808,8 @@ static inline const inkling_dspark_lr_entry * inkling_dspark_lr_get_or_build(
     cudaFree(d_H_f32);
 
     s_cache.push_back({ dev, w_out->data, w_ho->data, b_ho->data, V_full, K, R, d_M, d_bout });
-    return &s_cache.back();
+    out = s_cache.back();
+    return true;
 }
 
 template <int NWARPS>
@@ -5898,10 +5913,11 @@ static inline bool ggml_cuda_op_inkling_dspark_lowrank_head(
         ggml_tensor * dst,
         const float inv_cap,
         const float cap) {
-    const inkling_dspark_lr_entry * entry = inkling_dspark_lr_get_or_build(ctx, w_out, w_ho, b_ho);
-    if (!entry) {
+    inkling_dspark_lr_entry entry_v{};
+    if (!inkling_dspark_lr_get_or_build(ctx, w_out, w_ho, b_ho, entry_v)) {
         return false;
     }
+    const inkling_dspark_lr_entry * entry = &entry_v;
     const int V_out = (int) dst->ne[0];
     const int nb    = (int) dst->ne[1];
     const int base_stride = (int) (base->nb[1] / sizeof(float));
@@ -7372,7 +7388,9 @@ static __global__ void inkling_rel_pos_fattn_batched_mma_kpos(
     const int qr1    = qr0 + 8;
 
     __shared__ __align__(16) union {
-        half  s_K[4][16][136];    // 17,408 B
+        // 17 rows: a warp area must be >= the 4,608 B of s_VT[warp], else s_VT[w] overlaps s_K[w + 1].
+        // The KV loop has no block barrier, so that overlap is a data race between warps.
+        half  s_K[4][17][136];    // 18,496 B (row 16 is padding)
         half  s_VT[4][128][18];   // 18,432 B (bank-conflict-free)
         float s_red[4][8][132];   // 16,896 B (16B-aligned stride for float4 intra-block 4-warp reduction!)
     } wsmem;
@@ -7878,7 +7896,9 @@ static __global__ void inkling_rel_pos_fattn_batched_mma_dyn_kpos(
     const int qr1    = qr0 + 8;
 
     __shared__ __align__(16) union {
-        half  s_K[4][16][136];    // 17,408 B
+        // 17 rows: a warp area must be >= the 4,608 B of s_VT[warp], else s_VT[w] overlaps s_K[w + 1].
+        // The KV loop has no block barrier, so that overlap is a data race between warps.
+        half  s_K[4][17][136];    // 18,496 B (row 16 is padding)
         half  s_VT[4][128][18];   // 18,432 B
         float s_red[4][8][132];   // 16,896 B
     } wsmem;
@@ -8425,7 +8445,7 @@ static inline void ggml_cuda_op_inkling_rel_pos_fattn_ext(
             scratch.alloc((size_t) 8 * MAX_SPLITS * 3 * 132);
             scratch_ptr = scratch.get();
         }
-        int32_t * d_cnt = inkling_get_fattn_counters(ctx.device, ctx.curr_stream_no);
+        int32_t * d_cnt = inkling_get_fattn_counters(ctx);
         const dim3 fa_grid(8, n_splits, 1);
         const dim3 fa_block(32, 8, 1);
 
@@ -8502,7 +8522,7 @@ static inline void ggml_cuda_op_inkling_rel_pos_fattn_ext(
                 scratch.alloc((size_t) 8 * nqt * MAX_SPLITS * 16 * 132);
                 scratch_ptr = scratch.get();
             }
-            int32_t * d_cnt = inkling_get_fattn_counters(ctx.device, ctx.curr_stream_no);
+            int32_t * d_cnt = inkling_get_fattn_counters(ctx);
             const dim3 fa_grid(8, n_splits, nqt);
 
 #define LAUNCH_TBM(KQ, VQ, MF) \
@@ -8541,7 +8561,7 @@ static inline void ggml_cuda_op_inkling_rel_pos_fattn_ext(
             scratch.alloc((size_t) 8 * MAX_SPLITS * (3 * T_s) * 132);
             scratch_ptr = scratch.get();
         }
-        int32_t * d_cnt = inkling_get_fattn_counters(ctx.device, ctx.curr_stream_no);
+        int32_t * d_cnt = inkling_get_fattn_counters(ctx);
         const dim3 fa_grid(8, n_splits, 1);
 
 #define LAUNCH_TB(KQ, VQ, MF) \
@@ -8590,7 +8610,7 @@ static inline void ggml_cuda_op_inkling_rel_pos_fattn_ext(
             scratch.alloc((size_t) base_ctas * n_splits * 16 * 132);
             scratch_ptr = scratch.get();
         }
-        int32_t * d_cnt = inkling_get_fattn_counters(ctx.device, ctx.curr_stream_no);
+        int32_t * d_cnt = inkling_get_fattn_counters(ctx);
         const dim3 fa_grid(8, n_splits, nqt);
         const dim3 fa_blk(32, 4, 1);
 
@@ -8638,7 +8658,7 @@ static inline void ggml_cuda_op_inkling_rel_pos_fattn_ext(
     if (pre_splits > 1) {
         pre_scratch.alloc((size_t) 24 * q_blks * pre_splits * 64 * 132);
         pre_scratch_ptr = pre_scratch.get();
-        pre_cnt = inkling_get_fattn_counters(ctx.device, ctx.curr_stream_no);
+        pre_cnt = inkling_get_fattn_counters(ctx);
     }
     const dim3 pre_grid(24, q_blks * pre_splits, S);
     const dim3 pre_block(32, 4, 1);

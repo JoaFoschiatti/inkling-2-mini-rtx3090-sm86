@@ -19,8 +19,10 @@ if [[ "${1:-}" == "ref" ]]; then
   REF="$TOOLS/ref"
   rm -rf "$REF/src" && mkdir -p "$REF/src"
   git -C "$S" archive HEAD | tar -x -C "$REF/src"
-  LF="-Wl,-rpath-link,$E/lib:$E/targets/x86_64-linux/lib -Wl,-rpath,\$ORIGIN:$E/lib:$E/targets/x86_64-linux/lib"
+  # El RPATH va por CMake: escrito a mano en los flags, $ORIGIN llega vacío al enlazador y deja el directorio actual en la ruta de búsqueda.
+  LF="-Wl,-rpath-link,$E/lib:$E/targets/x86_64-linux/lib"
   cmake -S "$REF/src" -B "$REF/build" -G Ninja \
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON "-DCMAKE_INSTALL_RPATH=\$ORIGIN;$E/lib;$E/targets/x86_64-linux/lib" \
     -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
     -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DGGML_CUDA_F16=ON -DGGML_NATIVE=ON \
     -DCMAKE_CUDA_FLAGS="--use_fast_math -Xptxas=-O3" \

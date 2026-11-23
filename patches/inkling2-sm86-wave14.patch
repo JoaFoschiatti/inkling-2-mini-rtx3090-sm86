@@ -1,5 +1,5 @@
 diff --git a/common/sampling.cpp b/common/sampling.cpp
-index 078bfd9..2eb26dc 100644
+index 078bfd9..fc8664b 100644
 --- a/common/sampling.cpp
 +++ b/common/sampling.cpp
 @@ -4,6 +4,7 @@
@@ -10,12 +10,15 @@ index 078bfd9..2eb26dc 100644
  
  #include "ggml.h"
  
-@@ -125,16 +126,19 @@ struct common_sampler {
+@@ -125,16 +126,22 @@ struct common_sampler {
      // for rejection sampling; independent of the draft, or the target distribution is not preserved
      std::mt19937 rng;
  
 +    // Wave 10: reusable buffer for grammar-masked GPU rejection sampling (default-initialized after aggregate fields)
 +    std::vector<llama_token_data> cand_grmr = {};
++
++    // the chain picks the token with the highest raw logit, whatever the other samplers do
++    bool greedy_argmax = false;
 +
      void reset() {
          prev.clear();
@@ -34,7 +37,7 @@ index 078bfd9..2eb26dc 100644
  
          const llama_model * model = llama_get_model(ctx);
          const llama_vocab * vocab = llama_model_get_vocab(model);
-@@ -143,18 +147,23 @@ struct common_sampler {
+@@ -143,18 +150,23 @@ struct common_sampler {
  
          if (sampled_probs) {
              const uint32_t sampled_probs_count = llama_get_sampled_probs_count_ith(ctx, idx);
@@ -61,7 +64,23 @@ index 078bfd9..2eb26dc 100644
              GGML_ASSERT(logits != nullptr);
              cur.resize(n_vocab);
              for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
-@@ -427,14 +436,15 @@ struct common_sampler * common_sampler_init(
+@@ -335,6 +347,7 @@ struct common_sampler * common_sampler_init(
+     }
+ 
+     // logit bias: user biases + model suppress tokens (-INFINITY)
++    bool has_logit_bias = false;
+     {
+         std::vector<llama_logit_bias> merged = params.logit_bias;
+ 
+@@ -346,6 +359,7 @@ struct common_sampler * common_sampler_init(
+ 
+         if (!merged.empty()) {
+             samplers.push_back(llama_sampler_init_logit_bias(llama_vocab_n_tokens(vocab), merged.size(), merged.data()));
++            has_logit_bias = true;
+         }
+     }
+ 
+@@ -427,14 +441,15 @@ struct common_sampler * common_sampler_init(
          llama_sampler_chain_add(chain, smpl);
      }
  
@@ -81,7 +100,27 @@ index 078bfd9..2eb26dc 100644
  
          params.backend_sampling = false;
      }
-@@ -624,61 +634,142 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+@@ -451,6 +466,19 @@ struct common_sampler * common_sampler_init(
+         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+     };
+ 
++    {
++        // temp <= 0 collapses to the highest logit unless a sampler moves the maximum or the temperature is dynamic
++        bool moves_max = has_logit_bias || params.dynatemp_range > 0.0f || params.mirostat != 0 ||
++            params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f ||
++            params.dry_multiplier != 0.0f || params.xtc_probability != 0.0f;
++        bool has_temp = false;
++        for (const auto type : params.samplers) {
++            moves_max = moves_max || type == COMMON_SAMPLER_TYPE_INFILL || type == COMMON_SAMPLER_TYPE_ADAPTIVE_P;
++            has_temp  = has_temp  || type == COMMON_SAMPLER_TYPE_TEMPERATURE;
++        }
++        result->greedy_argmax = params.temp <= 0.0f && has_temp && params.n_probs == 0 && !moves_max;
++    }
++
+     return result;
+ }
+ 
+@@ -624,61 +652,138 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
      auto & chain = gsmpl->chain;
      auto & cur_p = gsmpl->cur_p; // initialized by set_logits
  
@@ -167,11 +206,7 @@ index 078bfd9..2eb26dc 100644
 +        // and non-forcing rbudget, scan raw logits directly (~0.05 ms vs ~1.5 ms 200K token_data copy).
 +        static const bool w9_no_fastfilter = (getenv("W9_NO_GBNF_FASTFILTER") != nullptr);
 +        const bool rbudget_forcing = rbudget && common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_FORCING;
-+        if (!w9_no_fastfilter && !grammar_first && !rbudget_forcing && gsmpl->params.temp <= 0.0f && gsmpl->params.n_probs == 0 &&
-+                gsmpl->params.logit_bias.empty() &&
-+                gsmpl->params.penalty_repeat == 1.0f && gsmpl->params.penalty_freq == 0.0f &&
-+                gsmpl->params.penalty_present == 0.0f && gsmpl->params.dry_multiplier == 0.0f &&
-+                gsmpl->params.xtc_probability == 0.0f && gsmpl->params.mirostat == 0 &&
++        if (!w9_no_fastfilter && !grammar_first && !rbudget_forcing && gsmpl->greedy_argmax &&
 +                llama_get_sampled_probs_ith(ctx, idx) == nullptr &&
 +                llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
 +            const float * raw_logits = llama_get_logits_ith(ctx, idx);
@@ -254,7 +289,7 @@ index 078bfd9..2eb26dc 100644
  
      llama_sampler_apply(rbudget,  &cur_p);
  
-@@ -686,7 +777,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
+@@ -686,7 +791,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
          llama_sampler_apply(grmr,  &cur_p);
      }
  
@@ -263,7 +298,7 @@ index 078bfd9..2eb26dc 100644
  
      GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
  
-@@ -730,6 +821,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
+@@ -730,6 +835,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
  }
  
  static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
@@ -273,7 +308,7 @@ index 078bfd9..2eb26dc 100644
      for (size_t k = 0; k < n; ++k) {
          if (data[k].id == id) {
              return data[k].p;
-@@ -738,6 +832,297 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
+@@ -738,6 +846,297 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
      return 0.0f;
  }
  
@@ -571,7 +606,7 @@ index 078bfd9..2eb26dc 100644
  // Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
  // Preserves the target distribution exactly, and accepts more often than matching does when the
  // draft samples instead of taking its argmax.
-@@ -748,6 +1133,21 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
+@@ -748,6 +1147,21 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
      std::vector<llama_token> result;
      result.reserve(idxs.size());
  
@@ -593,7 +628,7 @@ index 078bfd9..2eb26dc 100644
      // draws come from the sampler's own stream, so they stay independent of what was drafted
      std::uniform_real_distribution<float> uni(0.0f, 1.0f);
  
-@@ -793,10 +1193,14 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
+@@ -793,16 +1207,24 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
          const float q_x = prob_of(q.data(), q.size(), draft[i]);
  
          float p_x = 0.0f;
@@ -612,7 +647,17 @@ index 078bfd9..2eb26dc 100644
              }
          }
  
-@@ -847,6 +1251,322 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
+         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
+             common_sampler_accept(gsmpl, draft[i], true);
+             result.push_back(draft[i]);
++            // nothing follows an end of generation token, as in the device path
++            if (llama_vocab_is_eog(llama_model_get_vocab(llama_get_model(ctx)), draft[i]) && i + 1 < draft.size()) {
++                return result;
++            }
+             continue;
+         }
+ 
+@@ -847,6 +1269,324 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
      return result;
  }
  
@@ -921,12 +966,14 @@ index 078bfd9..2eb26dc 100644
 +
 +    // Graceful fallback (e.g. non-direct_ids top_k/top_p, grammar_first, output_swaps, or CPU sampler):
 +    // Fetch device q_probs rows to host and delegate to exact Wave 10 host path.
++    // a row holds the vocabulary of the draft model, which can be smaller than the one of the target
++    const uint32_t n_vocab_dft = ctx_dft ? (uint32_t) llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft))) : 0;
 +    std::vector<std::vector<float>> q_host(draft.size());
 +    for (size_t i = 0; i < draft.size(); ++i) {
 +        const float * q_row = ctx_dft ? llama_fetch_dev_q_probs_row(ctx_dft, (int32_t) i) : nullptr;
 +        q_host[i].resize(n_vocab, 0.0f);
 +        if (q_row) {
-+            std::memcpy(q_host[i].data(), q_row, (size_t) n_vocab * sizeof(float));
++            std::memcpy(q_host[i].data(), q_row, (size_t) std::min(n_vocab, n_vocab_dft) * sizeof(float));
 +        }
 +    }
 +    return common_sampler_sample_and_accept_n_rejection_probs(gsmpl, ctx_tgt, idxs, draft, q_host, grammar_first);
@@ -935,7 +982,7 @@ index 078bfd9..2eb26dc 100644
  std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
      std::vector<int> idxs(draft.size() + 1);
      for (size_t i = 0; i < idxs.size(); ++i) {
-@@ -868,6 +1588,19 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
+@@ -868,6 +1608,27 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
      return common_reasoning_budget_force(gsmpl->rbudget);
  }
  
@@ -945,8 +992,16 @@ index 078bfd9..2eb26dc 100644
 +    }
 +
 +    llama_tokens out(max_tokens);
-+    // Strict forced-prefix mode (-3): never guess optional whitespace so BPE boundaries always match DSpark/target.
-+    out[0] = -3;
++    // Whitespace mode of the forced prefix, see llama_grammar_draft_forced_prefix_impl.
++    // -4: the tokens up to the first optional whitespace are certain, the rest of the draft guesses the compact form.
++    //     A wrong guess only loses the tail of a draft that costs no drafter step. Measured on structured output:
++    //     100.9 t/s against 96.5 t/s for -3 (never guess), the same on tool calls. W14_GBNF_WS_MODE=-3 selects the strict mode.
++    static const int32_t ws_mode = []() {
++        const char * s = getenv("W14_GBNF_WS_MODE");
++        const int32_t v = (s && *s) ? atoi(s) : -4;
++        return (v == -2 || v == -3 || v == -4) ? v : -4;
++    }();
++    out[0] = ws_mode;
 +    const int32_t n = llama_sampler_grammar_draft_prefix(gsmpl->grmr, out.data(), max_tokens, false);
 +    out.resize(std::max<int32_t>(0, n));
 +    return out;
@@ -955,6 +1010,26 @@ index 078bfd9..2eb26dc 100644
  // helpers
  
  llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort) {
+@@ -876,15 +1637,16 @@ llama_token_data_array * common_sampler_get_candidates(struct common_sampler * g
+     auto * res = &gsmpl->cur_p;
+ 
+     if (do_sort && !res->sorted) {
+-        // remember the selected token before sorting
+-        const llama_token id = res->data[res->selected].id;
++        // remember the selected token before sorting, the fast paths leave no selection
++        const bool has_selected = res->selected >= 0 && (size_t) res->selected < res->size;
++        const llama_token id = has_selected ? res->data[res->selected].id : LLAMA_TOKEN_NULL;
+ 
+         std::sort(res->data, res->data + res->size, [](const llama_token_data & a, const llama_token_data & b) {
+             return a.p > b.p;
+         });
+ 
+         // restore the selected token after sorting
+-        for (size_t i = 0; i < res->size; ++i) {
++        for (size_t i = 0; has_selected && i < res->size; ++i) {
+             if (res->data[i].id == id) {
+                 res->selected = i;
+                 break;
 diff --git a/common/sampling.h b/common/sampling.h
 index f19bd27..1bc6dd6 100644
 --- a/common/sampling.h
@@ -983,7 +1058,7 @@ index f19bd27..1bc6dd6 100644
  
  // access the internal list of current candidate tokens
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index d4a7225..6a7b106 100644
+index d4a7225..440bf6e 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -216,6 +216,12 @@ struct common_speculative_impl {
@@ -1038,7 +1113,7 @@ index d4a7225..6a7b106 100644
                  }
                  backend_chains[seq_id] = chain;
              }
-@@ -1388,6 +1405,14 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
+@@ -1388,6 +1405,16 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
      std::vector<std::mt19937> rnn_rng;
      std::vector<int64_t>      rnn_seed;
  
@@ -1050,10 +1125,12 @@ index d4a7225..6a7b106 100644
 +    std::vector<float>                           rnn_params_buf;
 +    std::vector<std::vector<llama_token_data>>   rnn_q_pool;
 +
++    int32_t n_missing_context = 0;
++
      common_speculative_impl_draft_dspark(const common_params_speculative & params, uint32_t n_seq)
          : common_speculative_impl_draft_dflash(params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
      {
-@@ -1436,11 +1461,13 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
+@@ -1436,11 +1463,13 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
  
          // anchor-first DSpark yields a full block_size draft tokens
          // the recurrent head reads the context features back from h_nextn after a host copy injection
@@ -1071,7 +1148,22 @@ index d4a7225..6a7b106 100644
          });
  
          if (has_rnn_context) {
-@@ -1480,6 +1507,22 @@ protected:
+@@ -1455,6 +1484,14 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
+         }
+     }
+ 
++    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
++        common_speculative_impl_draft_dflash::begin(seq_id, prompt);
++        // reseed on the next draft, so the same request with the same seed drafts the same tokens
++        if (seq_id >= 0 && (size_t) seq_id < rnn_seed.size()) {
++            rnn_seed[seq_id] = -1;
++        }
++    }
++
+ protected:
+     void store_context_features(llama_seq_id seq_id, int32_t n_chunk) override {
+         if (!has_rnn_context) {
+@@ -1480,6 +1517,22 @@ protected:
  
  public:
  
@@ -1094,7 +1186,7 @@ index d4a7225..6a7b106 100644
      void draft(common_speculative_draft_params_vec & dparams) override {
          auto & ctx_dft = params.ctx_dft;
  
-@@ -1490,23 +1533,33 @@ public:
+@@ -1490,30 +1543,50 @@ public:
          std::vector<int32_t> i_block_beg(n_seq, -1);
          std::vector<int32_t> n_block    (n_seq,  0);
  
@@ -1107,6 +1199,19 @@ index d4a7225..6a7b106 100644
              if (!dp.drafting) {
                  continue;
              }
++            if (has_rnn_context) {
++                // a verified draft longer than the block overwrites the features of its first positions:
++                // skip this cycle, the features come back with the next single token step
++                const llama_pos pos = dp.pos0 - 1;
++                if (pos < 0 || context_pos[(size_t) seq_id * context_rows + (size_t) pos % context_rows] != pos) {
++                    if (n_missing_context++ % 256 == 0) {
++                        LOG_WRN("%s: no context features for seq_id %d at pos %d, no draft for this step (%d times)\n",
++                                __func__, (int) seq_id, (int) pos, n_missing_context);
++                    }
++                    continue;
++                }
++            }
++
 +            n_active_seqs++;
 +            single_seq_id = seq_id;
 +            if (dp.result_q != nullptr || dp.result_q_probs != nullptr || dp.result_q_ctx != nullptr) {
@@ -1130,7 +1235,14 @@ index d4a7225..6a7b106 100644
                  if (has_rnn_context) {
                      // the context features of the committed anchor condition the recurrent head
                      const llama_pos pos = dp.pos0 - 1;
-@@ -1523,7 +1576,101 @@ public:
+                     const size_t slot = (size_t) seq_id * context_rows + (size_t) pos % context_rows;
+-                    if (pos < 0 || context_pos[slot] != pos) {
+-                        throw std::runtime_error("DSpark committed context feature is missing");
+-                    }
+                     batch.set_embd_state(idx, { context_embd.data() + slot * (size_t) n_embd_dec, 1, (size_t) n_embd_dec });
+                 }
+             }
+@@ -1523,7 +1596,101 @@ public:
              return;
          }
  
@@ -1233,7 +1345,7 @@ index d4a7225..6a7b106 100644
          // decode all sequence's noise block in a single batch
          int ret = sample_rnn ? llama_draft_backbone(ctx_dft, batch.get())
                               : llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-@@ -1533,13 +1680,22 @@ public:
+@@ -1533,13 +1700,22 @@ public:
          }
  
          const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_dft)));
@@ -1261,7 +1373,7 @@ index d4a7225..6a7b106 100644
              }
          }
  
-@@ -1564,46 +1720,61 @@ public:
+@@ -1564,46 +1740,61 @@ public:
                  const float temp = dp.temp > 0.0f ? dp.temp : 1.0f;
                  const size_t slot = size_t(seq_id)*context_rows + size_t(dp.pos0 - 1)%context_rows;
                  const llama_embd context = { context_embd.data() + slot*n_embd_dec, 1, size_t(n_embd_dec) };
@@ -1345,7 +1457,7 @@ index d4a7225..6a7b106 100644
                      }
                  }
                  continue;
-@@ -1711,6 +1882,10 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
+@@ -1711,6 +1902,10 @@ struct common_speculative_impl_draft_dflash2 final : public common_speculative_i
          common_speculative_impl_draft_dflash::begin(seq_id, prompt);
      }
  
@@ -1356,7 +1468,7 @@ index d4a7225..6a7b106 100644
      void draft(common_speculative_draft_params_vec & dparams) override {
          auto & ctx_dft = params.ctx_dft;
  
-@@ -2008,6 +2183,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -2008,6 +2203,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
      std::vector<std::vector<float>> verify_h;
      std::vector<int32_t> verify_h_rows;
  
@@ -1367,7 +1479,7 @@ index d4a7225..6a7b106 100644
      std::vector<int>                i_last;
      std::vector<std::vector<float>> chain_h;
  
-@@ -3588,6 +3767,32 @@ void common_speculative_free(common_speculative * spec) {
+@@ -3588,6 +3787,32 @@ void common_speculative_free(common_speculative * spec) {
      delete spec;
  }
  
@@ -1400,7 +1512,7 @@ index d4a7225..6a7b106 100644
  common_speculative_draft_params & common_speculative_get_draft_params(
          common_speculative * spec,
          llama_seq_id seq_id) {
-@@ -3677,6 +3882,9 @@ void common_speculative_draft(common_speculative * spec) {
+@@ -3677,6 +3902,9 @@ void common_speculative_draft(common_speculative * spec) {
                          if (dp.result_q && !dp.result_q->empty()) {
                              dp.result_q->resize(dp.n_max);
                          }
@@ -1410,7 +1522,7 @@ index d4a7225..6a7b106 100644
                      }
                  }
  
-@@ -3713,11 +3921,20 @@ void common_speculative_draft(common_speculative * spec) {
+@@ -3713,11 +3941,20 @@ void common_speculative_draft(common_speculative * spec) {
      }
  }
  
@@ -1741,7 +1853,7 @@ index 5b7223a..039f552 100644
  void ggml_cuda_argmax(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 +void ggml_cuda_argmax_f32_raw(ggml_backend_cuda_context & ctx, const float * src0_d, int32_t * dst_d, int64_t ncols, int64_t nrows, int64_t row_stride_elems);
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 053ed60..1e2b121 100644
+index 053ed60..06e8b6f 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
 @@ -912,26 +912,19 @@ static __device__ __forceinline__ float ggml_cuda_ue4m3_to_fp32(uint8_t x) {
@@ -1780,8 +1892,18 @@ index 053ed60..1e2b121 100644
  }
  
  static __host__ __device__ __forceinline__ float ggml_cuda_f8_e4m3_to_fp32(uint8_t x) {
+@@ -1404,6 +1397,9 @@ struct ggml_backend_cuda_context {
+ 
+     int curr_stream_no = 0;
+ 
++    // device slots of the Inkling fused kernels, per stream (0: router counter, 1: attention counters, 2: conv state row index)
++    int32_t * inkling_slots[3][GGML_CUDA_MAX_STREAMS] = {};
++
+ #ifdef USE_CUDA_GRAPH
+     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
 diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
-index 10aa5af..f877c82 100644
+index 10aa5af..32b2c6a 100644
 --- a/ggml/src/ggml-cuda/fattn.cu
 +++ b/ggml/src/ggml-cuda/fattn.cu
 @@ -785,6 +785,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
@@ -1797,7 +1919,7 @@ index 10aa5af..f877c82 100644
      const ggml_tensor * Q = dst->src[0];
      const ggml_tensor * K = dst->src[1];
      const ggml_tensor * V = dst->src[2];
-@@ -836,5 +842,18 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+@@ -836,5 +842,31 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
  }
  
  bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
@@ -1805,8 +1927,21 @@ index 10aa5af..f877c82 100644
 +        const ggml_tensor * Q = dst->src[0];
 +        const ggml_tensor * K = dst->src[1];
 +        const ggml_tensor * V = dst->src[2];
++        const ggml_tensor * mask     = dst->src[3];
++        const ggml_tensor * sinks    = dst->src[4];
++        const ggml_tensor * rel_bias = dst->src[7];
++        const ggml_tensor * k_pos    = dst->src[8];
++        const ggml_tensor * q_pos    = dst->src[9];
 +        const int cc = ggml_cuda_info().devices[device].cc;
++        // the kernels read all of these without a check
++        if (Q == nullptr || K == nullptr || V == nullptr || mask == nullptr || sinks == nullptr ||
++                rel_bias == nullptr || k_pos == nullptr || q_pos == nullptr) {
++            return false;
++        }
 +        return cc >= GGML_CUDA_CC_AMPERE &&
++               (mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32) &&
++               sinks->type == GGML_TYPE_F32 && rel_bias->type == GGML_TYPE_F32 &&
++               k_pos->type == GGML_TYPE_I32 && q_pos->type == GGML_TYPE_I32 &&
 +               Q->type == GGML_TYPE_F32 &&
 +               Q->ne[0] == 128 && V->ne[0] == 128 &&
 +               Q->ne[2] == 24 && K->ne[2] == 8 && V->ne[2] == 8 &&
@@ -1817,7 +1952,7 @@ index 10aa5af..f877c82 100644
      return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
  }
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 3e1f167..ab13eb9 100644
+index 3e1f167..3e6a3a3 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -75,6 +75,7 @@
@@ -1836,7 +1971,24 @@ index 3e1f167..ab13eb9 100644
  #include <vector>
  
  #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-@@ -3109,7 +3111,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+@@ -1006,6 +1008,16 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+                 CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
+             }
+         }
++        if (i == device) {
++            for (auto & kind : inkling_slots) {
++                for (int32_t * slot : kind) {
++                    if (slot != nullptr) {
++                        ggml_cuda_set_device(device);
++                        CUDA_CHECK(cudaFree(slot));
++                    }
++                }
++            }
++        }
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11080
+         if (cublaslt_handles[i] != nullptr) {
+             CUBLAS_CHECK(cublasLtDestroy(cublaslt_handles[i]));
+@@ -3109,7 +3121,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
              ggml_cuda_op_argsort(ctx, dst);
              break;
          case GGML_OP_FLASH_ATTN_EXT:
@@ -1849,7 +2001,7 @@ index 3e1f167..ab13eb9 100644
              break;
          case GGML_OP_CROSS_ENTROPY_LOSS:
              ggml_cuda_cross_entropy_loss(ctx, dst);
-@@ -3784,6 +3790,8 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
+@@ -3784,6 +3800,8 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
      args.delayed_softmax = false;
      args.prob_bias       = false;
      args.norm            = false;
@@ -1858,7 +2010,7 @@ index 3e1f167..ab13eb9 100644
      args.n_groups        = 0;
      args.n_group_used    = 0;
  
-@@ -3904,20 +3912,33 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
+@@ -3904,20 +3922,33 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
      }
  
      if (nodes[node_idx]->op == GGML_OP_RESHAPE) {
@@ -1903,7 +2055,7 @@ index 3e1f167..ab13eb9 100644
          if (nodes[node_idx]->op != GGML_OP_DIV || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
              nodes[node_idx]->src[0] != nodes[node_idx - 3]) {
              args.norm = false;
-@@ -3933,7 +3954,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
+@@ -3933,7 +3964,7 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
          node_idx++;
      }
  
@@ -1912,7 +2064,7 @@ index 3e1f167..ab13eb9 100644
          args.scale = true;
      }
  
-@@ -3979,7 +4000,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+@@ -3979,7 +4010,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
              for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                  const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
  
@@ -1922,7 +2074,7 @@ index 3e1f167..ab13eb9 100644
                      continue;
                  }
  
-@@ -4465,8 +4487,214 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+@@ -4465,8 +4497,214 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
      return false;
  }
  
@@ -2138,7 +2290,7 @@ index 3e1f167..ab13eb9 100644
  
      if (ggml_cuda_fusion_disabled()) {
          return 0;
-@@ -4534,6 +4762,351 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4534,6 +4772,355 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          }
      }
  
@@ -2311,7 +2463,9 @@ index 3e1f167..ab13eb9 100644
 +                                    dn_rw->type == GGML_TYPE_F32 && ggml_is_contiguous(dn_rw) && ggml_are_same_shape(dn_rw, dn_sc) &&
 +                                    dn_dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dn_dst) &&
 +                                    dn_dst->ne[0] == dn_mm->ne[0] && dn_dst->ne[1] == T_moe && dn_dst->ne[2] == 1 && dn_dst->ne[3] == 1 &&
-+                                    (((uintptr_t) dn_dst->data) & 15) == 0;
++                                    (((uintptr_t) dn_dst->data) & 15) == 0 &&
++                                    // the T == 1 down kernel reads ids and weights while it writes dn_dst
++                                    (T_moe != 1 || (!tensor_overlaps(dn_dst, ids) && !tensor_overlaps(dn_dst, weights)));
 +                                for (int e = 0; ok && e < n_exp; ++e) {
 +                                    const ggml_tensor * vw = cgraph->nodes[p_dn + 6 + e];
 +                                    if (vw->src[0] != dn_rw || vw->view_src != dn_rw ||
@@ -2430,7 +2584,9 @@ index 3e1f167..ab13eb9 100644
 +                                    dn_rw->type == GGML_TYPE_F32 && ggml_is_contiguous(dn_rw) && ggml_are_same_shape(dn_rw, dn_mm) &&
 +                                    dn_dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dn_dst) &&
 +                                    dn_dst->ne[0] == dn_mm->ne[0] && dn_dst->ne[1] == T_moe && dn_dst->ne[2] == 1 && dn_dst->ne[3] == 1 &&
-+                                    (((uintptr_t) dn_dst->data) & 15) == 0;
++                                    (((uintptr_t) dn_dst->data) & 15) == 0 &&
++                                    // the T == 1 down kernel reads ids and weights while it writes dn_dst
++                                    (T_moe != 1 || (!tensor_overlaps(dn_dst, ids) && !tensor_overlaps(dn_dst, weights)));
 +                                for (int e = 0; ok && e < n_exp; ++e) {
 +                                    const ggml_tensor * vw = cgraph->nodes[p_dn + 2 + e];
 +                                    if (vw->src[0] != dn_rw || vw->view_src != dn_rw ||
@@ -2490,7 +2646,7 @@ index 3e1f167..ab13eb9 100644
      //topk-moe
      if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
              cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
-@@ -4576,7 +5149,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -4576,7 +5163,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
  
                  if (args.norm) {
                      ops.insert(ops.end(),
@@ -2501,7 +2657,7 @@ index 3e1f167..ab13eb9 100644
                      clamp = cgraph->nodes[i + ops.size() - 3];
                  }
                  if (args.scale) {
-@@ -5058,6 +5633,577 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5058,6 +5647,577 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return fused_node_count - 1;
      }
  
@@ -3079,7 +3235,7 @@ index 3e1f167..ab13eb9 100644
      fused_mul_mat_vec = false;
      fused_node_count  = 0;
  
-@@ -5265,7 +6411,128 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5265,7 +6425,128 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 2;
      }
  
@@ -3208,7 +3364,7 @@ index 3e1f167..ab13eb9 100644
          ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
          return 1;
      }
-@@ -5302,52 +6569,1372 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+@@ -5302,37 +6583,1357 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
          return 3;
      }
  
@@ -3311,27 +3467,6 @@ index 3e1f167..ab13eb9 100644
 -
 -static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
 -    bool graph_evaluated_or_captured = false;
--
--    // flag used to determine whether it is an integrated_gpu
--    const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
--
--    ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
--    bool                         is_concurrent_event_active = false;
--    ggml_cuda_concurrent_event * concurrent_event           = nullptr;
--    bool                         should_launch_concurrent_events = false;
--
--#ifdef USE_CUDA_GRAPH
--    ggml_cuda_graph * graph      = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
--    const int         chunk_size = ggml_cuda_graph_chunk_size();
--    int               chunk_end  = chunk_size;
--    size_t            n_chunks   = 0;
--#endif // USE_CUDA_GRAPH
--
--    const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
--        if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
--            concurrent_event = &stream_ctx.concurrent_events[node];
--
--            is_concurrent_event_active = true;
 +    // A0) Fused L2 row clip WITH scale + trailing per-token tau MUL (10 ops -> 1 warp kernel, full-attn Q & R):
 +    if (node->op == GGML_OP_MUL && i + 9 < cgraph->n_nodes && cgraph->nodes[i + 9]->op == GGML_OP_MUL) {
 +        static const ggml_op ops_clip10[10] = {
@@ -3372,7 +3507,8 @@ index 3e1f167..ab13eb9 100644
 +        }
 +    }
  
--            GGML_LOG_DEBUG("Launching %d streams at %s\n", concurrent_event->n_streams, node->name);
+-    // flag used to determine whether it is an integrated_gpu
+-    const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
 +    // A) Fused L2 row clip WITH scale (9 ops -> 1 warp kernel):
 +    //    MUL(x, scale) -> SQR -> SUM_ROWS -> SQRT -> SCALE(s, b) -> FILL(thr) -> DIV(fill, norm) -> CLAMP(cmin, cmax) -> MUL(cur, clamp)
 +    if (node->op == GGML_OP_MUL && i + 8 < cgraph->n_nodes) {
@@ -3414,9 +3550,10 @@ index 3e1f167..ab13eb9 100644
 +        }
 +    }
  
--            cudaStream_t main_stream = cuda_ctx->stream();  // this should be stream 0
--            GGML_ASSERT(cuda_ctx->curr_stream_no == 0);
--            CUDA_CHECK(cudaEventRecord(concurrent_event->fork_event, main_stream));
+-    ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
+-    bool                         is_concurrent_event_active = false;
+-    ggml_cuda_concurrent_event * concurrent_event           = nullptr;
+-    bool                         should_launch_concurrent_events = false;
 +    // B0) Fused Kcur L2 row clip WITHOUT scale + VIEW + SET_ROWS (10 ops -> 1 warp kernel writing directly to KV cache!):
 +    if (node->op == GGML_OP_SQR && i + 9 < cgraph->n_nodes &&
 +            cgraph->nodes[i + 8]->op == GGML_OP_VIEW &&
@@ -3464,9 +3601,12 @@ index 3e1f167..ab13eb9 100644
 +        }
 +    }
  
--            for (int i = 1; i <= concurrent_event->n_streams; ++i) {
--                cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, i);
--                CUDA_CHECK(cudaStreamWaitEvent(stream, concurrent_event->fork_event));
+-#ifdef USE_CUDA_GRAPH
+-    ggml_cuda_graph * graph      = use_cuda_graph ? cuda_ctx->cuda_graph(graph_key) : nullptr;
+-    const int         chunk_size = ggml_cuda_graph_chunk_size();
+-    int               chunk_end  = chunk_size;
+-    size_t            n_chunks   = 0;
+-#endif // USE_CUDA_GRAPH
 +    // B1) Fused Vcur RMS_NORM + VIEW + SET_ROWS (3 ops -> 1 warp kernel writing directly to KV cache!):
 +    if (node->op == GGML_OP_RMS_NORM && i + 2 < cgraph->n_nodes &&
 +            cgraph->nodes[i + 1]->op == GGML_OP_VIEW &&
@@ -3492,12 +3632,13 @@ index 3e1f167..ab13eb9 100644
 +                    ggml_is_contiguous(row_idxs) && row_idxs->ne[0] == x->ne[2] && row_idxs->ne[1] == 1 && row_idxs->ne[2] == 1) {
 +                ggml_cuda_op_inkling_rms_norm_set_rows(*cuda_ctx, x, row_idxs, n_sr, ggml_get_op_params_f32(n_rms, 0));
 +                return 2;
-             }
-         }
--    };
++            }
++        }
 +    }
  
--    while (!graph_evaluated_or_captured) {
+-    const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
+-        if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
+-            concurrent_event = &stream_ctx.concurrent_events[node];
 +    // B) Fused L2 row clip WITHOUT scale (8 ops -> 1 warp kernel):
 +    //    SQR(x) -> SUM_ROWS -> SQRT -> SCALE(s, b) -> FILL(thr) -> DIV(fill, norm) -> CLAMP(cmin, cmax) -> MUL(x, clamp)
 +    if (node->op == GGML_OP_SQR && i + 7 < cgraph->n_nodes) {
@@ -3534,7 +3675,8 @@ index 3e1f167..ab13eb9 100644
 +            }
 +        }
 +    }
-+
+ 
+-            is_concurrent_event_active = true;
 +    // C) Fused SiTU activation (10 ops with intervening VIEW -> 1 float4 kernel, supports strided gate_up views!):
 +    //    SCALE(g, 1/b) -> TANH -> SCALE(b) -> SIGMOID(g) -> MUL -> VIEW(up) -> SCALE(u, 1/lb) -> TANH -> SCALE(lb) -> MUL
 +    if (node->op == GGML_OP_SCALE && i + 9 < cgraph->n_nodes) {
@@ -4601,25 +4743,10 @@ index 3e1f167..ab13eb9 100644
 +            concurrent_event = &stream_ctx.concurrent_events[node];
 +
 +            is_concurrent_event_active = true;
-+
-+            GGML_LOG_DEBUG("Launching %d streams at %s\n", concurrent_event->n_streams, node->name);
-+
-+            cudaStream_t main_stream = cuda_ctx->stream();  // this should be stream 0
-+            GGML_ASSERT(cuda_ctx->curr_stream_no == 0);
-+            CUDA_CHECK(cudaEventRecord(concurrent_event->fork_event, main_stream));
-+
-+            for (int i = 1; i <= concurrent_event->n_streams; ++i) {
-+                cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, i);
-+                CUDA_CHECK(cudaStreamWaitEvent(stream, concurrent_event->fork_event));
-+            }
-+        }
-+    };
-+
-+    while (!graph_evaluated_or_captured) {
-         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
-         // With the use of CUDA graphs, the execution will be performed by the graph launch.
-         if (!use_cuda_graph || cuda_graph_update_required) {
-@@ -5415,6 +8002,34 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+             GGML_LOG_DEBUG("Launching %d streams at %s\n", concurrent_event->n_streams, node->name);
+ 
+@@ -5415,6 +8016,34 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  stream_ctx.concurrent_events.clear();
              }
  
@@ -4654,7 +4781,7 @@ index 3e1f167..ab13eb9 100644
              for (int i = 0; i < cgraph->n_nodes; i++) {
                  ggml_tensor * node = cgraph->nodes[i];
  #ifdef USE_CUDA_GRAPH
-@@ -5466,9 +8081,113 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5466,9 +8095,113 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue;
                  }
  
@@ -4727,7 +4854,7 @@ index 3e1f167..ab13eb9 100644
 +                    }
 +                    if (can_skip && n_concats > 0 &&
 +                            (inkling_rs_idx_copied_src == nullptr || inkling_rs_idx_copied_src == node->src[1])) {
-+                        int32_t * d_rs_idx = inkling_get_rs_idx_slot(cuda_ctx->device, cuda_ctx->curr_stream_no);
++                        int32_t * d_rs_idx = inkling_get_rs_idx_slot(*cuda_ctx);
 +                        if (inkling_rs_idx_copied_src == nullptr) {
 +                            CUDA_CHECK(cudaMemcpyAsync(d_rs_idx, node->src[1]->data, sizeof(int32_t), cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
 +                            inkling_rs_idx_copied_src = node->src[1];
@@ -4769,7 +4896,35 @@ index 3e1f167..ab13eb9 100644
  #ifdef GGML_CUDA_DEBUG
                      const int last_fused = i + nodes_to_skip;
                      GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
-@@ -5500,11 +8219,84 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -5495,16 +8228,112 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 GGML_UNUSED(integrated);
+ #endif  // NDEBUG
+ 
++                // only the fused shortconv kernels can read a skipped GET_ROWS: compute it now if this consumer was not fused
++                if (!inkling_skipped_get_rows.empty()) {
++                    for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                        const ggml_tensor * t = node->src[s];
++                        for (int hop = 0; hop < 8 && t != nullptr; ++hop) {
++                            auto it = inkling_skipped_get_rows.find(t);
++                            if (it != inkling_skipped_get_rows.end()) {
++                                const ggml_tensor * state_src = it->second.first;
++                                const int n_row = (int) t->ne[0];
++                                inkling_get_state_row_f32<<<(n_row + 255) / 256, 256, 0, cuda_ctx->stream()>>>(
++                                    (const float *) state_src->data, it->second.second, (float *) t->data,
++                                    state_src->nb[1] / sizeof(float), n_row);
++                                inkling_skipped_get_rows.erase(it);
++                                break;
++                            }
++                            if (t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE) {
++                                break;
++                            }
++                            t = t->view_src ? t->view_src : t->src[0];
++                        }
++                    }
++                }
++
+                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                 if (!ok) {
                      GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                  }
                  GGML_ASSERT(ok);
@@ -4854,7 +5009,17 @@ index 3e1f167..ab13eb9 100644
          }
  
  #ifdef USE_CUDA_GRAPH
-@@ -5616,8 +8408,53 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -5607,6 +8436,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ #endif // USE_CUDA_GRAPH
+ 
+     if (use_cuda_graph && cuda_graph_update_required) {
++        // the slots are allocated with a blocking memset, so not inside the capture
++        inkling_ensure_ctx_slots(*cuda_ctx);
++
+         // Start CUDA graph capture
+         {
+             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+@@ -5616,8 +8448,53 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
          CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
      }
  
@@ -4908,7 +5073,7 @@ index 3e1f167..ab13eb9 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -5729,6 +8566,49 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5729,6 +8606,49 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  }
              }
  
@@ -4958,7 +5123,7 @@ index 3e1f167..ab13eb9 100644
              ggml_cuda_moe_weighted_reduction_match match;
              if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                  params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
-@@ -5740,6 +8620,385 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5740,6 +8660,385 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                  i += match.node_count - 1;
              }
  
@@ -5344,7 +5509,7 @@ index 3e1f167..ab13eb9 100644
              if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
                      cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
                  ggml_cuda_topk_moe_args args;
-@@ -5778,7 +9037,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5778,7 +9077,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
  
                          if (args.norm) {
                              ops.insert(ops.end(),
@@ -5355,7 +5520,7 @@ index 3e1f167..ab13eb9 100644
                          }
                          if (args.scale) {
                              ops.insert(ops.end(), { GGML_OP_SCALE });
-@@ -5789,8 +9050,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+@@ -5789,8 +9090,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
  
                          if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                                  ggml_cuda_should_use_topk_moe(node, logits, weights, ids)) {
@@ -5366,7 +5531,7 @@ index 3e1f167..ab13eb9 100644
                              i += ops.size() - 1;
                          }
                      }
-@@ -7028,6 +10289,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+@@ -7028,6 +10329,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
      if (strcmp(name, "ggml_backend_get_features") == 0) {
          return (void *)ggml_backend_cuda_get_features;
      }
@@ -5381,10 +5546,10 @@ index 3e1f167..ab13eb9 100644
  
 diff --git a/ggml/src/ggml-cuda/inkling-fused.cuh b/ggml/src/ggml-cuda/inkling-fused.cuh
 new file mode 100644
-index 0000000..927a060
+index 0000000..e2a0483
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/inkling-fused.cuh
-@@ -0,0 +1,9312 @@
+@@ -0,0 +1,9332 @@
 +#pragma once
 +
 +#include "common.cuh"
@@ -8939,30 +9104,51 @@ index 0000000..927a060
 +    }
 +}
 +
-+static inline int32_t * inkling_get_router_counter(const int device, const int stream_no) {
-+    static int32_t * d_cnts[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
-+    const int s = (stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS) ? stream_no : 0;
-+    if (d_cnts[device][s] == nullptr) {
-+        int32_t * ptr = nullptr;
-+        CUDA_CHECK(cudaMalloc(&ptr, sizeof(int32_t)));
-+        CUDA_CHECK(cudaMemset(ptr, 0, sizeof(int32_t)));
-+        d_cnts[device][s] = ptr;
++// The counters and the row index slot belong to the context: two contexts on one device have their own streams,
++// so slots shared by (device, stream_no) would be written by both at the same time.
++static inline int32_t * inkling_get_ctx_slot(ggml_backend_cuda_context & ctx, const int kind, const size_t n) {
++    const int s = (ctx.curr_stream_no >= 0 && ctx.curr_stream_no < GGML_CUDA_MAX_STREAMS) ? ctx.curr_stream_no : 0;
++    int32_t *& slot = ctx.inkling_slots[kind][s];
++    if (slot == nullptr) {
++        CUDA_CHECK(cudaMalloc(&slot, n * sizeof(int32_t)));
++        CUDA_CHECK(cudaMemset(slot, 0, n * sizeof(int32_t)));
 +    }
-+    return d_cnts[device][s];
++    return slot;
++}
++
++static inline int32_t * inkling_get_router_counter(ggml_backend_cuda_context & ctx) {
++    return inkling_get_ctx_slot(ctx, 0, 1);
++}
++
++static inline int32_t * inkling_get_fattn_counters(ggml_backend_cuda_context & ctx) {
++    return inkling_get_ctx_slot(ctx, 1, 1024);
 +}
 +
 +// Persistent 4-byte GPU slot holding a safe copy of rs_s_copy[0] across the whole graph
 +// (prevents ggml_gallocr reuse of rs_s_copy after the last skipped GET_ROWS from clobbering Layer 47!).
-+static inline int32_t * inkling_get_rs_idx_slot(const int device, const int stream_no) {
-+    static int32_t * d_slots[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
-+    const int s = (stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS) ? stream_no : 0;
-+    if (d_slots[device][s] == nullptr) {
-+        int32_t * ptr = nullptr;
-+        CUDA_CHECK(cudaMalloc(&ptr, sizeof(int32_t)));
-+        CUDA_CHECK(cudaMemset(ptr, 0, sizeof(int32_t)));
-+        d_slots[device][s] = ptr;
++static inline int32_t * inkling_get_rs_idx_slot(ggml_backend_cuda_context & ctx) {
++    return inkling_get_ctx_slot(ctx, 2, 1);
++}
++
++// One state row read through the persistent index slot. A GET_ROWS that was skipped and then needed after all
++// cannot run as the plain op: its index tensor may be reused by the allocator after the position of the node.
++static __global__ void inkling_get_state_row_f32(
++        const float * __restrict__ src,
++        const int32_t * __restrict__ row_idx,
++        float * __restrict__ dst,
++        const size_t row_stride_f,
++        const int n) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < n) {
++        dst[i] = src[(size_t) row_idx[0] * row_stride_f + i];
 +    }
-+    return d_slots[device][s];
++}
++
++// Allocate the slots of the current stream before a stream capture starts.
++static inline void inkling_ensure_ctx_slots(ggml_backend_cuda_context & ctx) {
++    inkling_get_router_counter(ctx);
++    inkling_get_fattn_counters(ctx);
++    inkling_get_rs_idx_slot(ctx);
 +}
 +
 +static inline void ggml_cuda_op_inkling_router_topk128(
@@ -8979,7 +9165,7 @@ index 0000000..927a060
 +        const float scale_val) {
 +    const int D4 = (int) (w->ne[0] >> 2);
 +    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), 256);
-+    int32_t * d_cnt = inkling_get_router_counter(ctx.device, ctx.curr_stream_no);
++    int32_t * d_cnt = inkling_get_router_counter(ctx);
 +    inkling_fused_router_topk128_64blk<<<64, dim3(32, 4, 1), 0, ctx.stream()>>>(
 +        (const float4 *) w->data,
 +        (const float4 *) x->data,
@@ -9391,7 +9577,7 @@ index 0000000..927a060
 +    ggml_cuda_pool_alloc<float>      r_scratch(ctx.pool(), 256);
 +    ggml_cuda_pool_alloc<block_q8_1> y_q8_in(ctx.pool(), (size_t) (K / QK8_1));
 +    ggml_cuda_pool_alloc<block_q8_1> y_q8_mid(ctx.pool(), (size_t) n_exp_used * (n_ff / QK8_1));
-+    int32_t * d_cnt = inkling_get_router_counter(ctx.device, ctx.curr_stream_no);
++    int32_t * d_cnt = inkling_get_router_counter(ctx);
 +
 +    // Launch 1: 64 router blocks + ceil(K/256) idle-SM input pre-quantize blocks (73 blocks on 82 SMs!)
 +    const int n_qblks = (K + 255) / 256;
@@ -9475,7 +9661,7 @@ index 0000000..927a060
 +    ggml_cuda_pool_alloc<float>      r_scratch(ctx.pool(), 256);
 +    ggml_cuda_pool_alloc<block_q8_1> y_q8_in(ctx.pool(), (size_t) nb_gu);
 +    ggml_cuda_pool_alloc<block_q8_1> y_q8_mid(ctx.pool(), (size_t) n_exp_used * nb_dn);
-+    int32_t * d_cnt = inkling_get_router_counter(ctx.device, ctx.curr_stream_no);
++    int32_t * d_cnt = inkling_get_router_counter(ctx);
 +
 +    const int n_qblks = (K + 255) / 256;
 +    inkling_fused_router_topk128_q8_73blk<false><<<64 + n_qblks, dim3(32, 4, 1), 0, stream>>>(
@@ -9869,18 +10055,6 @@ index 0000000..927a060
 +#endif
 +}
 +
-+static inline int32_t * inkling_get_fattn_counters(const int device, const int stream_no) {
-+    static int32_t * d_cnts[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
-+    const int s = (stream_no >= 0 && stream_no < GGML_CUDA_MAX_STREAMS) ? stream_no : 0;
-+    if (d_cnts[device][s] == nullptr) {
-+        int32_t * ptr = nullptr;
-+        CUDA_CHECK(cudaMalloc(&ptr, 1024 * sizeof(int32_t)));
-+        CUDA_CHECK(cudaMemset(ptr, 0, 1024 * sizeof(int32_t)));
-+        d_cnts[device][s] = ptr;
-+    }
-+    return d_cnts[device][s];
-+}
-+
 +static inline void ggml_cuda_op_inkling_rel_pos_fattn_wo(
 +        ggml_backend_cuda_context & ctx,
 +        const ggml_tensor * Q,
@@ -9933,7 +10107,7 @@ index 0000000..927a060
 +        scratch.alloc((size_t) 8 * MAX_SPLITS * 3 * 132);
 +        scratch_ptr = scratch.get();
 +    }
-+    int32_t * d_cnt = inkling_get_fattn_counters(ctx.device, ctx.curr_stream_no);
++    int32_t * d_cnt = inkling_get_fattn_counters(ctx);
 +
 +    const dim3 fa_grid(n_splits, 8, 1);
 +    const dim3 fa_block(32, 3, 1);
@@ -10797,7 +10971,7 @@ index 0000000..927a060
 +    const int ids_stride = (int) (ids->nb[1] / sizeof(int32_t));
 +    cudaStream_t stream = ctx.stream();
 +    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), (size_t) 2 * T * 128);
-+    int32_t * d_cnt = inkling_get_router_counter(ctx.device, ctx.curr_stream_no);
++    int32_t * d_cnt = inkling_get_router_counter(ctx);
 +    inkling_launch_router_batched<false, false>(
 +        (const float4 *) w->data, (const float4 *) x->data,
 +        bias ? (const float *) bias->data : nullptr,
@@ -10846,7 +11020,7 @@ index 0000000..927a060
 +    ggml_cuda_pool_alloc<float>              mid_f32(ctx.pool(), (size_t) n_pairs * n_ff);
 +    ggml_cuda_pool_alloc<block_q8_1>         y_q8_mid(ctx.pool(), (size_t) n_pairs * (n_ff / QK8_1));
 +    ggml_cuda_pool_alloc<float>              dn_tmp(ctx.pool(), (size_t) n_pairs * nrows);
-+    int32_t * d_cnt = inkling_get_router_counter(ctx.device, ctx.curr_stream_no);
++    int32_t * d_cnt = inkling_get_router_counter(ctx);
 +
 +    // Launch 1: Batched Router + TopK128 + Pre-Interleaved Input Q8_1 Quantize
 +    const int n_qblks = (K + 255) / 256;
@@ -10950,7 +11124,7 @@ index 0000000..927a060
 +    ggml_cuda_pool_alloc<float>              mid_f32(ctx.pool(), (size_t) n_pairs * n_ff);
 +    ggml_cuda_pool_alloc<block_q8_1>         y_q8_mid(ctx.pool(), (size_t) n_pairs * nb_dn);
 +    ggml_cuda_pool_alloc<float>              dn_tmp(ctx.pool(), (size_t) n_pairs * nrows);
-+    int32_t * d_cnt = inkling_get_router_counter(ctx.device, ctx.curr_stream_no);
++    int32_t * d_cnt = inkling_get_router_counter(ctx);
 +
 +    const int n_qblks = (K + 255) / 256;
 +    inkling_launch_router_batched<false, true>(
@@ -11047,11 +11221,13 @@ index 0000000..927a060
 +    float *      d_bout;
 +};
 +
-+static inline const inkling_dspark_lr_entry * inkling_dspark_lr_get_or_build(
++// Copies the entry to out: a pointer into the cache does not survive the next build.
++static inline bool inkling_dspark_lr_get_or_build(
 +        ggml_backend_cuda_context & ctx,
 +        const ggml_tensor * w_out,
 +        const ggml_tensor * w_ho,
-+        const ggml_tensor * b_ho) {
++        const ggml_tensor * b_ho,
++        inkling_dspark_lr_entry & out) {
 +    static std::mutex s_mtx;
 +    static std::vector<inkling_dspark_lr_entry> s_cache;
 +
@@ -11065,7 +11241,8 @@ index 0000000..927a060
 +        for (const auto & e : s_cache) {
 +            if (e.device == dev && e.w_out == w_out->data && e.w_ho == w_ho->data && e.b_ho == b_ho->data &&
 +                    e.V_full == V_full && e.K == K && e.R == R) {
-+                return &e;
++                out = e;
++                return true;
 +            }
 +        }
 +    }
@@ -11073,18 +11250,19 @@ index 0000000..927a060
 +    cudaStream_t stream = ctx.stream();
 +    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
 +    if (cudaStreamIsCapturing(stream, &cap_status) != cudaSuccess || cap_status != cudaStreamCaptureStatusNone) {
-+        return nullptr;
++        return false;
 +    }
 +
 +    std::lock_guard<std::mutex> lock(s_mtx);
 +    for (const auto & e : s_cache) {
 +        if (e.device == dev && e.w_out == w_out->data && e.w_ho == w_ho->data && e.b_ho == b_ho->data &&
 +                e.V_full == V_full && e.K == K && e.R == R) {
-+            return &e;
++            out = e;
++            return true;
 +        }
 +    }
 +
-+    if (s_cache.size() >= 2) {
++    if (s_cache.size() >= 4) {
 +        int prev_dev = dev;
 +        if (s_cache.front().device != dev) {
 +            ggml_cuda_set_device(s_cache.front().device);
@@ -11100,11 +11278,11 @@ index 0000000..927a060
 +    half  * d_M    = nullptr;
 +    float * d_bout = nullptr;
 +    if (cudaMalloc(&d_M, (size_t) V_full * R * sizeof(half)) != cudaSuccess) {
-+        return nullptr;
++        return false;
 +    }
 +    if (cudaMalloc(&d_bout, (size_t) V_full * sizeof(float)) != cudaSuccess) {
 +        cudaFree(d_M);
-+        return nullptr;
++        return false;
 +    }
 +
 +    constexpr int CHUNK_V = 4096;
@@ -11121,7 +11299,7 @@ index 0000000..927a060
 +        cudaFree(d_H_f32);
 +        cudaFree(d_bout);
 +        cudaFree(d_M);
-+        return nullptr;
++        return false;
 +    }
 +
 +    const float * H_ptr = nullptr;
@@ -11137,6 +11315,7 @@ index 0000000..927a060
 +        H_ptr = d_H_f32;
 +    }
 +
++    // The handle is in TF32 math mode: only the PEDANTIC compute type gives a true FP32 GEMM (6e-7 vs 3e-4 relative error).
 +    cublasHandle_t cublas_h = ctx.cublas_handle();
 +    const float alpha = 1.0f;
 +    const float beta  = 0.0f;
@@ -11157,7 +11336,7 @@ index 0000000..927a060
 +            d_W_chunk, CUDA_R_32F, K,
 +            &beta,
 +            d_M_chunk, CUDA_R_32F, R,
-+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
++            CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
 +
 +        const size_t n_m = (size_t) vc * R;
 +        inkling_f32_to_f16_elem<<<(unsigned) ((n_m + 255) / 256), 256, 0, stream>>>(
@@ -11172,7 +11351,7 @@ index 0000000..927a060
 +            b_ho->data, CUDA_R_32F, K,
 +            &beta,
 +            d_bout + v0, CUDA_R_32F, vc,
-+            CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
++            CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
 +    }
 +
 +    CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -11181,7 +11360,8 @@ index 0000000..927a060
 +    cudaFree(d_H_f32);
 +
 +    s_cache.push_back({ dev, w_out->data, w_ho->data, b_ho->data, V_full, K, R, d_M, d_bout });
-+    return &s_cache.back();
++    out = s_cache.back();
++    return true;
 +}
 +
 +template <int NWARPS>
@@ -11285,10 +11465,11 @@ index 0000000..927a060
 +        ggml_tensor * dst,
 +        const float inv_cap,
 +        const float cap) {
-+    const inkling_dspark_lr_entry * entry = inkling_dspark_lr_get_or_build(ctx, w_out, w_ho, b_ho);
-+    if (!entry) {
++    inkling_dspark_lr_entry entry_v{};
++    if (!inkling_dspark_lr_get_or_build(ctx, w_out, w_ho, b_ho, entry_v)) {
 +        return false;
 +    }
++    const inkling_dspark_lr_entry * entry = &entry_v;
 +    const int V_out = (int) dst->ne[0];
 +    const int nb    = (int) dst->ne[1];
 +    const int base_stride = (int) (base->nb[1] / sizeof(float));
@@ -12759,7 +12940,9 @@ index 0000000..927a060
 +    const int qr1    = qr0 + 8;
 +
 +    __shared__ __align__(16) union {
-+        half  s_K[4][16][136];    // 17,408 B
++        // 17 rows: a warp area must be >= the 4,608 B of s_VT[warp], else s_VT[w] overlaps s_K[w + 1].
++        // The KV loop has no block barrier, so that overlap is a data race between warps.
++        half  s_K[4][17][136];    // 18,496 B (row 16 is padding)
 +        half  s_VT[4][128][18];   // 18,432 B (bank-conflict-free)
 +        float s_red[4][8][132];   // 16,896 B (16B-aligned stride for float4 intra-block 4-warp reduction!)
 +    } wsmem;
@@ -13265,7 +13448,9 @@ index 0000000..927a060
 +    const int qr1    = qr0 + 8;
 +
 +    __shared__ __align__(16) union {
-+        half  s_K[4][16][136];    // 17,408 B
++        // 17 rows: a warp area must be >= the 4,608 B of s_VT[warp], else s_VT[w] overlaps s_K[w + 1].
++        // The KV loop has no block barrier, so that overlap is a data race between warps.
++        half  s_K[4][17][136];    // 18,496 B (row 16 is padding)
 +        half  s_VT[4][128][18];   // 18,432 B
 +        float s_red[4][8][132];   // 16,896 B
 +    } wsmem;
@@ -13812,7 +13997,7 @@ index 0000000..927a060
 +            scratch.alloc((size_t) 8 * MAX_SPLITS * 3 * 132);
 +            scratch_ptr = scratch.get();
 +        }
-+        int32_t * d_cnt = inkling_get_fattn_counters(ctx.device, ctx.curr_stream_no);
++        int32_t * d_cnt = inkling_get_fattn_counters(ctx);
 +        const dim3 fa_grid(8, n_splits, 1);
 +        const dim3 fa_block(32, 8, 1);
 +
@@ -13889,7 +14074,7 @@ index 0000000..927a060
 +                scratch.alloc((size_t) 8 * nqt * MAX_SPLITS * 16 * 132);
 +                scratch_ptr = scratch.get();
 +            }
-+            int32_t * d_cnt = inkling_get_fattn_counters(ctx.device, ctx.curr_stream_no);
++            int32_t * d_cnt = inkling_get_fattn_counters(ctx);
 +            const dim3 fa_grid(8, n_splits, nqt);
 +
 +#define LAUNCH_TBM(KQ, VQ, MF) \
@@ -13928,7 +14113,7 @@ index 0000000..927a060
 +            scratch.alloc((size_t) 8 * MAX_SPLITS * (3 * T_s) * 132);
 +            scratch_ptr = scratch.get();
 +        }
-+        int32_t * d_cnt = inkling_get_fattn_counters(ctx.device, ctx.curr_stream_no);
++        int32_t * d_cnt = inkling_get_fattn_counters(ctx);
 +        const dim3 fa_grid(8, n_splits, 1);
 +
 +#define LAUNCH_TB(KQ, VQ, MF) \
@@ -13977,7 +14162,7 @@ index 0000000..927a060
 +            scratch.alloc((size_t) base_ctas * n_splits * 16 * 132);
 +            scratch_ptr = scratch.get();
 +        }
-+        int32_t * d_cnt = inkling_get_fattn_counters(ctx.device, ctx.curr_stream_no);
++        int32_t * d_cnt = inkling_get_fattn_counters(ctx);
 +        const dim3 fa_grid(8, n_splits, nqt);
 +        const dim3 fa_blk(32, 4, 1);
 +
@@ -14025,7 +14210,7 @@ index 0000000..927a060
 +    if (pre_splits > 1) {
 +        pre_scratch.alloc((size_t) 24 * q_blks * pre_splits * 64 * 132);
 +        pre_scratch_ptr = pre_scratch.get();
-+        pre_cnt = inkling_get_fattn_counters(ctx.device, ctx.curr_stream_no);
++        pre_cnt = inkling_get_fattn_counters(ctx);
 +    }
 +    const dim3 pre_grid(24, q_blks * pre_splits, S);
 +    const dim3 pre_block(32, 4, 1);
@@ -15002,7 +15187,7 @@ index ecd6677..eaa909b 100644
  
  struct ggml_tensor * ggml_flash_attn_back(
 diff --git a/include/llama.h b/include/llama.h
-index 7122143..995fd8e 100644
+index 7122143..2fd6334 100644
 --- a/include/llama.h
 +++ b/include/llama.h
 @@ -1147,6 +1147,9 @@ extern "C" {
@@ -15024,12 +15209,14 @@ index 7122143..995fd8e 100644
  
      // mirror of llama_sampler_i:
      LLAMA_API struct llama_sampler * llama_sampler_init  (      struct llama_sampler_i * iface, llama_sampler_context_t ctx);
-@@ -1571,6 +1576,14 @@ extern "C" {
+@@ -1571,6 +1576,16 @@ extern "C" {
                 const llama_token * trigger_tokens,
                              size_t num_trigger_tokens);
  
 +    // Wave 9C: extract deterministically forced draft tokens from an active grammar sampler
 +    // without mutating its state. Returns the number of tokens written to out_tokens.
++    // On entry out_tokens[0] selects how optional whitespace is handled: -3 never guess, -4 guess the compact form
++    // after the first token, -2 pretty-printed JSON, any other value always guess the compact form.
 +    LLAMA_API int32_t llama_sampler_grammar_draft_prefix(
 +            const struct llama_sampler * smpl,
 +                           llama_token * out_tokens,
@@ -15040,7 +15227,7 @@ index 7122143..995fd8e 100644
      /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
      LLAMA_API struct llama_sampler * llama_sampler_init_penalties(
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index a9f0150..bea2c90 100644
+index a9f0150..6227b63 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -795,11 +795,13 @@ void llama_context::sched_new(const sched_params & params) {
@@ -15059,17 +15246,22 @@ index a9f0150..bea2c90 100644
  
      LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
  
-@@ -814,7 +816,18 @@ void llama_context::sched_reserve() {
+@@ -814,7 +816,23 @@ void llama_context::sched_reserve() {
  
      LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
  
 -    gf_res_prev_active = nullptr;
 +    gf_res_prev_active     = nullptr;
 +    gf_res_prev_active_inj = nullptr;
++    gf_res_prev_active_t1  = nullptr;
 +    if (gf_res_prev_inj) {
 +        gf_res_prev_inj->reset();
 +    }
++    if (gf_res_prev_t1) {
++        gf_res_prev_t1->reset();
++    }
 +    sched_inj.reset();
++    sched_t1.reset();
 +    last_ubatch_sched    = nullptr;
 +    logits_deferred      = false;
 +    logits_dev_tensor    = nullptr;
@@ -15079,7 +15271,7 @@ index a9f0150..bea2c90 100644
  
      gf_res_reserve->set_max_nodes(max_nodes);
      gf_res_reserve->reset();
-@@ -959,6 +972,10 @@ void llama_context::sched_reserve() {
+@@ -959,6 +977,10 @@ void llama_context::sched_reserve() {
  
      LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
              __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
@@ -15090,25 +15282,32 @@ index a9f0150..bea2c90 100644
  }
  
  void llama_context::synchronize() {
-@@ -967,6 +984,9 @@ void llama_context::synchronize() {
+@@ -967,6 +989,12 @@ void llama_context::synchronize() {
      }
  
      ggml_backend_sched_synchronize(sched.get());
++    if (sched_t1) {
++        ggml_backend_sched_synchronize(sched_t1.get());
++    }
 +    if (sched_inj) {
 +        ggml_backend_sched_synchronize(sched_inj.get());
 +    }
  
      // FIXME: if multiple single tokens are evaluated without a synchronization,
      // the stats will be added to the prompt evaluation stats
-@@ -1069,7 +1089,16 @@ bool llama_context::memory_update(bool optimize) {
+@@ -1069,7 +1097,20 @@ bool llama_context::memory_update(bool optimize) {
          for (auto & res : gf_res_prev) {
              res->reset();
          }
 -        gf_res_prev_active = nullptr;
 +        gf_res_prev_active     = nullptr;
 +        gf_res_prev_active_inj = nullptr;
++        gf_res_prev_active_t1  = nullptr;
 +        if (gf_res_prev_inj) {
 +            gf_res_prev_inj->reset();
++        }
++        if (gf_res_prev_t1) {
++            gf_res_prev_t1->reset();
 +        }
 +        logits_deferred      = false;
 +        logits_dev_tensor    = nullptr;
@@ -15118,7 +15317,7 @@ index a9f0150..bea2c90 100644
  
          if (!mctx->apply()) {
              LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
-@@ -1101,7 +1130,253 @@ enum llama_pooling_type llama_context::pooling_type() const {
+@@ -1101,7 +1142,262 @@ enum llama_pooling_type llama_context::pooling_type() const {
      return cparams.pooling_type;
  }
  
@@ -15133,6 +15332,15 @@ index a9f0150..bea2c90 100644
 +        ggml_backend_tensor_get(logits_dev_tensor, logits.data, 0,
 +                                (size_t) logits_dev_n_outputs * n_vocab * sizeof(float));
 +    }
++}
++
++void llama_context::flush_deferred_outputs() {
++    // the device tensors of the current graph do not survive the next one: copy what was not read yet
++    fetch_deferred_logits();
++    fetch_all_deferred_probs();
++    logits_dev_tensor    = nullptr;
++    logits_dev_backend   = nullptr;
++    logits_dev_n_outputs = 0;
 +}
 +
 +void llama_context::clear_deferred_probs() {
@@ -15203,7 +15411,7 @@ index a9f0150..bea2c90 100644
 +            ggml_nelements(t_logits) != (int64_t) n_outputs * n_vocab) {
 +        return false;
 +    }
-+    ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
++    ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_last(), t_logits);
 +    if (!backend_res) {
 +        return false;
 +    }
@@ -15372,7 +15580,7 @@ index a9f0150..bea2c90 100644
      output_reorder();
  
      return logits.data;
-@@ -1137,6 +1412,7 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
+@@ -1137,6 +1433,7 @@ int64_t llama_context::output_resolve_row(int32_t i) const {
  }
  
  float * llama_context::get_logits_ith(int32_t i) {
@@ -15380,7 +15588,7 @@ index a9f0150..bea2c90 100644
      output_reorder();
  
      try {
-@@ -1269,6 +1545,9 @@ float * llama_context::get_sampled_probs_ith(int32_t idx) {
+@@ -1269,6 +1566,9 @@ float * llama_context::get_sampled_probs_ith(int32_t idx) {
          if ((size_t) row >= sampling.probs_count.size() || sampling.probs_count[row] == 0) {
              return nullptr;
          }
@@ -15390,7 +15598,7 @@ index a9f0150..bea2c90 100644
          return sampling.probs.data + row*model.vocab.n_tokens();
      } catch (const std::exception & err) {
          LLAMA_LOG_ERROR("%s: invalid backend sampled probs id %d, reason: %s\n", __func__, idx, err.what());
-@@ -1707,6 +1986,30 @@ bool llama_context::get_causal_attn() const {
+@@ -1707,6 +2007,34 @@ bool llama_context::get_causal_attn() const {
      return cparams.causal_attn;
  }
  
@@ -15400,6 +15608,9 @@ index a9f0150..bea2c90 100644
 +        sig += llama_sampler_name(llama_sampler_chain_get(chain, i));
 +        sig += ';';
 +    }
++    // samplers with the same names can build graphs of different sizes (temp <= 0 is an argmax, f.ex.)
++    sig += '#';
++    sig += std::to_string(llama_sampler_backend_n_nodes(chain));
 +    return sig;
 +}
 +
@@ -15410,7 +15621,8 @@ index a9f0150..bea2c90 100644
 +
 +    // the graph of the previous sampler must not be reused
 +    synchronize();
-+    gf_res_prev_active   = nullptr;
++    gf_res_prev_active    = nullptr;
++    gf_res_prev_active_t1 = nullptr;
 +    logits_deferred      = false;
 +    logits_dev_tensor    = nullptr;
 +    logits_dev_backend   = nullptr;
@@ -15421,7 +15633,7 @@ index a9f0150..bea2c90 100644
  bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
      if (!sampler && sampling.samplers.count(seq_id) == 0) {
          return true;
-@@ -1720,10 +2023,12 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+@@ -1720,10 +2048,14 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
              LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
              warned = true;
          }
@@ -15431,13 +15643,15 @@ index a9f0150..bea2c90 100644
 +        const bool had_sampler = sampling.samplers.count(seq_id) > 0;
          sampling.samplers.erase(seq_id);
 +        sampling.sig_cur.erase(seq_id);
++        sampling.need_probs.erase(seq_id);
++        sampling.need_logits.erase(seq_id);
 +        if (had_sampler) {
 +            sampler_changed();
 +        }
          return false;
      }
  
-@@ -1739,8 +2044,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+@@ -1739,8 +2071,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
          sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
  
          sampling.samplers[seq_id] = sampler;
@@ -15448,7 +15662,7 @@ index a9f0150..bea2c90 100644
  
          return true;
      }
-@@ -1748,22 +2054,36 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
+@@ -1748,22 +2081,38 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
      if (sampler && !can_offload) {
          LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
  
@@ -15459,6 +15673,8 @@ index a9f0150..bea2c90 100644
  
          sampling.samplers.erase(seq_id);
 +        sampling.sig_cur.erase(seq_id);
++        sampling.need_probs.erase(seq_id);
++        sampling.need_logits.erase(seq_id);
 +
 +        if (had_sampler) {
 +            sampler_changed();
@@ -15489,7 +15705,7 @@ index a9f0150..bea2c90 100644
  void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
      LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
  
-@@ -1830,36 +2150,69 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1830,36 +2179,90 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          return nullptr;
      }
  
@@ -15502,10 +15718,31 @@ index a9f0150..bea2c90 100644
 +        n_outputs == 0 && ubatch.n_tokens <= 8 &&
 +        !cparams.training && !cparams.pipeline_parallel;
 +
++    // Wave 14: the plain step of a speculation target does not share a scheduler with the verification batches
++    static const bool w14_no_t1_sched = (getenv("W14_NO_T1_SCHED") != nullptr);
++    const bool use_t1_sched = !w14_no_t1_sched && !use_inj_sched &&
++        cparams.n_rs_seq > 0 &&
++        gtype == LLM_GRAPH_TYPE_DEFAULT &&
++        n_outputs == 1 && ubatch.n_tokens == 1 &&
++        !cparams.training && !cparams.pipeline_parallel;
++
 +    ggml_backend_sched_t active_sched = sched.get();
 +    llm_graph_result * res = nullptr;
-+    llm_graph_result * & active_prev = use_inj_sched ? gf_res_prev_active_inj : gf_res_prev_active;
-+    if (use_inj_sched) {
++    llm_graph_result * & active_prev = use_inj_sched ? gf_res_prev_active_inj :
++                                       use_t1_sched  ? gf_res_prev_active_t1  : gf_res_prev_active;
++    if (use_t1_sched) {
++        if (!sched_t1) {
++            const size_t max_nodes_t1 = this->graph_max_nodes();
++            sched_t1.reset(ggml_backend_sched_new(
++                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
++                max_nodes_t1, false, cparams.op_offload));
++            ggml_backend_sched_set_copy_callback(sched_t1.get(), sched_copy_experts, this);
++            ggml_backend_sched_set_realloc_callback(sched_t1.get(), sched_graph_realloc, this);
++            gf_res_prev_t1 = std::make_unique<llm_graph_result>(max_nodes_t1);
++        }
++        active_sched = sched_t1.get();
++        res = gf_res_prev_t1.get();
++    } else if (use_inj_sched) {
 +        if (!sched_inj) {
 +            const size_t max_nodes_inj = std::max<size_t>(512, this->graph_max_nodes());
 +            sched_inj.reset(ggml_backend_sched_new(
@@ -15569,7 +15806,7 @@ index a9f0150..bea2c90 100644
  
          if (!gf) {
              LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
-@@ -1867,31 +2220,39 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1867,31 +2270,39 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
              return nullptr;
          }
  
@@ -15616,10 +15853,35 @@ index a9f0150..bea2c90 100644
  
      ret = GGML_STATUS_SUCCESS;
  
-@@ -2150,6 +2511,21 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+@@ -1977,6 +2388,8 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
+     //       ref: https://github.com/ggml-org/llama.cpp/pull/12181#issuecomment-2730451223
+     cparams.causal_attn = false;
+ 
++    flush_deferred_outputs();
++
+     ggml_status status;
+     const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+ 
+@@ -2150,6 +2563,37 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
      return false; // all sequences use backend sampling
  }
  
++// a sequence without an explicit request for the sampled logits follows the request for the probabilities
++static bool needs_sampled_logits(const llama_ubatch & ubatch, const std::map<llama_seq_id, bool> & need_logits, bool need_probs) {
++    for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
++        if (!ubatch.output[i]) {
++            continue;
++        }
++        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
++            auto it = need_logits.find(ubatch.seq_id[i][j]);
++            if (it == need_logits.end() ? need_probs : it->second) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
 +static bool needs_sampled_probs(const llama_ubatch & ubatch, const std::map<llama_seq_id, bool> & need_probs) {
 +    for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
 +        if (!ubatch.output[i]) {
@@ -15638,7 +15900,7 @@ index a9f0150..bea2c90 100644
  int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtype) {
      if (!memory) {
          LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
-@@ -2182,6 +2558,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
+@@ -2182,6 +2626,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
      const auto & vocab   = model.vocab;
      const auto & hparams = model.hparams;
  
@@ -15655,7 +15917,15 @@ index a9f0150..bea2c90 100644
      const int64_t n_vocab = vocab.n_tokens();
  
      // when computing embeddings, all tokens are output
-@@ -2424,14 +2810,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
+@@ -2419,19 +2873,39 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
+         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
+         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
+ 
++        // a device tensor can only stay unread if no later ubatch reuses the compute buffer
++        const bool is_last_ubatch = (uint64_t) n_tokens_prev + ubatch.n_tokens == n_tokens_all;
++
+         if (t_embd && res->get_embd_pooled()) {
+             t_embd = res->get_embd_pooled();
          }
  
          // extract logits
@@ -15667,7 +15937,7 @@ index a9f0150..bea2c90 100644
 +            if (gtype == LLM_GRAPH_TYPE_DRAFT_PROBABILISTIC && try_store_dev_q_probs(t_logits, n_outputs_prev, n_outputs, n_outputs_all)) {
 +                // Wave 11 Spec: kept DSpark q_probs on device (~5 us D2D into persistent q_probs_dev, 0 B PCIe D2H)
 +            } else if (needs_raw_logits(ubatch, sampling.samplers)) {
-+                ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
++                ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_last(), t_logits);
 +                GGML_ASSERT(backend_res != nullptr);
 +                GGML_ASSERT(logits.data != nullptr);
  
@@ -15678,43 +15948,54 @@ index a9f0150..bea2c90 100644
 +                GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
 +                GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
 +                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
-+            } else if (n_outputs_prev == 0 && n_outputs == n_outputs_all) {
++            } else if (n_outputs_prev == 0 && n_outputs == n_outputs_all && is_last_ubatch) {
 +                // Single-ubatch output (100% of decode & speculative verification steps):
 +                // keep raw logits on device (0 PCIe traffic); fetch lazily only if grammar rejects a GPU sample.
 +                logits_deferred      = true;
 +                logits_dev_tensor    = t_logits;
-+                logits_dev_backend   = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
++                logits_dev_backend   = ggml_backend_sched_get_tensor_backend(sched_last(), t_logits);
 +                logits_dev_n_outputs = n_outputs;
 +            } else {
 +                // Multi-ubatch outputs: copy async so earlier ubatch logits remain valid if needed.
-+                ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
++                ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_last(), t_logits);
 +                GGML_ASSERT(backend_res != nullptr);
 +                float * logits_out = logits.data + n_outputs_prev*n_vocab;
                  GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                  GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                  ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
-@@ -2510,7 +2913,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
+@@ -2440,7 +2914,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
+ 
+         // extract embeddings
+         if (embd.data && t_embd && n_outputs > 0) {
+-            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
++            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched_last(), t_embd);
+             GGML_ASSERT(backend_embd != nullptr);
+ 
+             switch (cparams.pooling_type) {
+@@ -2510,7 +2984,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
  
              // the device buffer replaces the host extraction, see build_h_nextn_dev()
              if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE && !write_h_nextn) {
 -                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
-+                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(last_ubatch_sched ? last_ubatch_sched : sched.get(), t_h_nextn);
++                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_last(), t_h_nextn);
                  GGML_ASSERT(backend_h != nullptr);
  
                  const uint32_t n_embd  = hparams.n_embd_out();
-@@ -2534,9 +2937,77 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
+@@ -2533,10 +3007,78 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
+             const auto stride = n_vocab;
  
              // async copy the sampling data from the backend to the host
-             copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
+-            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
 -            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
 -            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
 -            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
++            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched_last());
 +            const bool need_probs  = needs_sampled_probs(ubatch, sampling.need_probs);
-+            const bool need_logits = need_probs && needs_sampled_probs(ubatch, sampling.need_logits);
++            const bool need_logits = needs_sampled_logits(ubatch, sampling.need_logits, need_probs);
 +            const bool all_sampled = !res->t_sampled.empty() &&
 +                std::all_of(res->t_sampled.begin(), res->t_sampled.end(), [](const ggml_tensor * t) { return t != nullptr; });
 +            if (need_logits || !all_sampled) {
-+                copy_tensor_async_rows(res->t_sampled_logits, sampling.logits, stride, n_outputs_prev, sched.get(), &sampling.logits_count);
++                copy_tensor_async_rows(res->t_sampled_logits, sampling.logits, stride, n_outputs_prev, sched_last(), &sampling.logits_count);
 +            } else if (!sampling.logits_count.empty()) {
 +                for (size_t i = 0; i < res->t_sampled_logits.size(); ++i) {
 +                    const uint32_t row = n_outputs_prev + i;
@@ -15726,7 +16007,7 @@ index a9f0150..bea2c90 100644
 +            if (need_probs) {
 +                static const bool w11_no_gpu_reject = (getenv("W11_NO_GPU_REJECT") != nullptr);
 +                bool can_defer_probs = !w11_no_gpu_reject &&
-+                    n_outputs_prev == 0 && n_outputs == n_outputs_all &&
++                    n_outputs_prev == 0 && n_outputs == n_outputs_all && is_last_ubatch &&
 +                    n_outputs > 0 && res->t_sampled_probs.size() == (size_t) n_outputs &&
 +                    std::all_of(res->t_candidates.begin(), res->t_candidates.end(), [](const ggml_tensor * t) { return t == nullptr; });
 +                ggml_backend_t b_probs = nullptr;
@@ -15737,7 +16018,7 @@ index a9f0150..bea2c90 100644
 +                            can_defer_probs = false;
 +                            break;
 +                        }
-+                        ggml_backend_t bt = ggml_backend_sched_get_tensor_backend(sched.get(), t);
++                        ggml_backend_t bt = ggml_backend_sched_get_tensor_backend(sched_last(), t);
 +                        if (!bt || (b_probs != nullptr && bt != b_probs)) {
 +                            can_defer_probs = false;
 +                            break;
@@ -15760,7 +16041,7 @@ index a9f0150..bea2c90 100644
 +                        }
 +                    }
 +                } else {
-+                    copy_tensor_async_rows(res->t_sampled_probs, sampling.probs, stride, n_outputs_prev, sched.get(), &sampling.probs_count);
++                    copy_tensor_async_rows(res->t_sampled_probs, sampling.probs, stride, n_outputs_prev, sched_last(), &sampling.probs_count);
 +                }
 +            } else if (!sampling.probs_count.empty()) {
 +                for (size_t i = 0; i < res->t_sampled_probs.size(); ++i) {
@@ -15771,7 +16052,7 @@ index a9f0150..bea2c90 100644
 +                }
 +            }
 +            if (need_probs || !all_sampled) {
-+                copy_tensor_async_rows(res->t_candidates, sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
++                copy_tensor_async_rows(res->t_candidates, sampling.candidates, stride, n_outputs_prev, sched_last(), &sampling.candidates_count);
 +            } else if (!sampling.candidates_count.empty()) {
 +                for (size_t i = 0; i < res->t_candidates.size(); ++i) {
 +                    const uint32_t row = n_outputs_prev + i;
@@ -15783,7 +16064,7 @@ index a9f0150..bea2c90 100644
          }
  
          n_outputs_prev += n_outputs;
-@@ -2624,7 +3095,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
+@@ -2624,7 +3166,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp, llm_graph_type gtyp
  }
  
  bool llama_context::draft_step(llama_token token, llama_embd hidden, llama_embd base, llama_embd context,
@@ -15792,7 +16073,7 @@ index a9f0150..bea2c90 100644
      const auto & hp = model.hparams;
      const size_t width = hp.n_embd;
      const size_t vocab = model.vocab.n_tokens();
-@@ -2634,10 +3105,15 @@ bool llama_context::draft_step(llama_token token, llama_embd hidden, llama_embd
+@@ -2634,10 +3176,15 @@ bool llama_context::draft_step(llama_token token, llama_embd hidden, llama_embd
          return false;
      }
      synchronize();
@@ -15812,16 +16093,33 @@ index a9f0150..bea2c90 100644
  
      llama_batch_ext batch(this);
      batch.mem = nullptr;
-@@ -2648,7 +3124,7 @@ bool llama_context::draft_step(llama_token token, llama_embd hidden, llama_embd
+@@ -2648,8 +3195,15 @@ bool llama_context::draft_step(llama_token token, llama_embd hidden, llama_embd
          return false;
      }
      auto ubatch = balloc->split_simple(1);
 -    ubatch.embd_state = inputs.data();
 +    ubatch.embd_state = draft_step_inputs.data();
      n_outputs = 1;
++    flush_deferred_outputs();
++    // the head graph has a softmax only when probabilities are requested, and graph reuse does not see that
++    const bool head_probs = temp > 0.0f;
++    if (head_probs != draft_head_probs) {
++        draft_head_probs   = head_probs;
++        gf_res_prev_active = nullptr;
++    }
      ggml_status status;
      const auto * result = process_ubatch(ubatch, LLM_GRAPH_TYPE_DRAFT_HEAD, nullptr, status);
-@@ -2865,6 +3341,13 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
+     if (!result) {
+@@ -2855,7 +3409,7 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
+         const size_t dst_offset = token_offset * row_floats;
+         GGML_ASSERT(dst_offset + nfloats <= embd_layer_inp[il].size);
+ 
+-        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
++        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched_last(), t);
+         GGML_ASSERT(backend != nullptr);
+         // Tensor-split backends require a zero source offset.
+         ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+@@ -2865,6 +3419,13 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
  }
  
  void llama_context::output_reorder() {
@@ -15835,7 +16133,25 @@ index a9f0150..bea2c90 100644
      const uint64_t n_vocab     = model.vocab.n_tokens();
      const uint64_t n_embd      = model.hparams.n_embd;
      const uint64_t n_embd_out  = model.hparams.n_embd_out();
-@@ -3109,13 +3592,14 @@ llm_graph_params llama_context::graph_params(
+@@ -3053,13 +3614,16 @@ ggml_cgraph * llama_context::graph_reserve(
+         LLAMA_LOG_DEBUG("%s: making n_tokens a multiple of n_seqs - n_tokens = %u, n_seqs = %u, n_outputs = %u\n", __func__, n_tokens, n_seqs, n_outputs);
+     }
+ 
++    flush_deferred_outputs();
++
+     ggml_backend_sched_reset(sched.get());
+ 
+     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
+     for (auto & res : gf_res_prev) {
+         res->reset();
+     }
+-    gf_res_prev_active = nullptr;
++    gf_res_prev_active    = nullptr;
++    gf_res_prev_active_t1 = nullptr;
+ 
+     // store the n_outputs as it is, and restore it afterwards
+     // TODO: not sure if needed, might simplify in the future by removing this
+@@ -3109,13 +3673,14 @@ llm_graph_params llama_context::graph_params(
                          llm_graph_result * res,
                        const llama_ubatch & ubatch,
              const llama_memory_context_i * mctx,
@@ -15852,7 +16168,16 @@ index a9f0150..bea2c90 100644
          /*.backend_cpu =*/ backend_cpu,
          /*.cvec        =*/ cvec.get(),
          /*.loras       =*/ loras.get(),
-@@ -3154,7 +3638,8 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph
+@@ -3128,7 +3693,7 @@ llm_graph_params llama_context::graph_params(
+         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
+         /*.samplers    =*/ sampling.samplers,
+         /*.n_outputs   =*/ n_outputs,
+-        /*.cb          =*/ graph_get_cb(),
++        /*.cb          =*/ graph_get_cb(custom_sched ? custom_sched : sched.get()),
+         /*.res         =*/ res,
+     };
+ }
+@@ -3154,7 +3719,8 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph
  
  ggml_status llama_context::graph_compute(
              ggml_cgraph * gf,
@@ -15862,7 +16187,7 @@ index a9f0150..bea2c90 100644
      int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
      ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
  
-@@ -3173,7 +3658,7 @@ ggml_status llama_context::graph_compute(
+@@ -3173,7 +3739,7 @@ ggml_status llama_context::graph_compute(
  
      copy_experts.reset();
  
@@ -15871,7 +16196,27 @@ index a9f0150..bea2c90 100644
      if (status != GGML_STATUS_SUCCESS) {
          LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
      }
-@@ -4731,6 +5216,12 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
+@@ -3267,8 +3833,8 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
+     return true;
+ }
+ 
+-llm_graph_cb llama_context::graph_get_cb() const {
+-    return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
++llm_graph_cb llama_context::graph_get_cb(ggml_backend_sched_t sched_cb) const {
++    return [this, sched_cb](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+         if (il >= 0) {
+             ggml_format_name(cur, "%s-%d", name, il);
+         } else {
+@@ -3285,7 +3851,7 @@ llm_graph_cb llama_context::graph_get_cb() const {
+                 for (const auto & backend : backends) {
+                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
+                         if (ggml_backend_supports_op(backend.get(), cur)) {
+-                            ggml_backend_sched_set_tensor_backend(sched.get(), cur, backend.get());
++                            ggml_backend_sched_set_tensor_backend(sched_cb, cur, backend.get());
+                         }
+                     }
+                 }
+@@ -4731,6 +5297,12 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
      return res;
  }
  
@@ -15884,7 +16229,7 @@ index a9f0150..bea2c90 100644
  float * llama_get_embeddings(llama_context * ctx) {
      ctx->synchronize();
  
-@@ -4815,6 +5306,14 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
+@@ -4815,6 +5387,14 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
      return ctx->set_sampler(seq_id, smpl);
  }
  
@@ -15899,7 +16244,7 @@ index a9f0150..bea2c90 100644
  llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
      ctx->synchronize();
  
-@@ -5220,7 +5719,39 @@ int32_t llama_draft_backbone(llama_context * ctx, const llama_batch_ext * batch)
+@@ -5220,7 +5800,39 @@ int32_t llama_draft_backbone(llama_context * ctx, const llama_batch_ext * batch)
      return ctx->decode(*batch, LLM_GRAPH_TYPE_DRAFT_BACKBONE);
  }
  
@@ -15942,7 +16287,7 @@ index a9f0150..bea2c90 100644
 +            n_accepted_out, resid_token_out, accept_mask_out);
  }
 diff --git a/src/llama-context.h b/src/llama-context.h
-index 4bea8f6..d1b279a 100644
+index 4bea8f6..39de913 100644
 --- a/src/llama-context.h
 +++ b/src/llama-context.h
 @@ -108,6 +108,21 @@ struct llama_context {
@@ -15994,7 +16339,7 @@ index 4bea8f6..d1b279a 100644
  
  private:
      llm_graph_result * get_gf_res_prev();
-@@ -294,7 +312,8 @@ private:
+@@ -294,9 +312,10 @@ private:
                          llm_graph_result * res,
                        const llama_ubatch & ubatch,
              const llama_memory_context_i * mctx,
@@ -16002,9 +16347,12 @@ index 4bea8f6..d1b279a 100644
 +                          llm_graph_type   gtype,
 +                    ggml_backend_sched_t   custom_sched = nullptr) const;
  
-     llm_graph_cb graph_get_cb() const;
+-    llm_graph_cb graph_get_cb() const;
++    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched_cb) const;
  
-@@ -351,6 +370,26 @@ private:
+     // parameters defining the backend scheduler instance
+     struct sched_params {
+@@ -351,6 +370,27 @@ private:
      // decode output (2-dimensional array: [n_outputs][n_vocab])
      buffer_view<float> logits = {nullptr, 0};
  
@@ -16015,6 +16363,7 @@ index 4bea8f6..d1b279a 100644
 +    uint32_t       logits_dev_n_outputs = 0;
 +
 +    void fetch_deferred_logits();
++    void flush_deferred_outputs();
 +
 +    // Wave 11 Spec: deferred per-row host copy of backend sampled_probs (0 B D2H on GPU rejection path)
 +    bool                         probs_deferred    = false;
@@ -16031,7 +16380,7 @@ index 4bea8f6..d1b279a 100644
      // embeddings output (2-dimensional array: [n_outputs][n_embd])
      // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
      buffer_view<float> embd = {nullptr, 0};
-@@ -368,6 +407,13 @@ private:
+@@ -368,6 +408,13 @@ private:
      struct sampling_info {
          // !samplers.empty() to check if any samplers are active
          std::map<llama_seq_id, llama_sampler *> samplers;
@@ -16045,15 +16394,16 @@ index 4bea8f6..d1b279a 100644
  
          buffer_view<float>       logits     = {nullptr, 0};
          buffer_view<llama_token> sampled    = {nullptr, 0};
-@@ -383,6 +429,7 @@ private:
+@@ -383,6 +430,8 @@ private:
      };
  
      sampling_info sampling;
 +    std::vector<float> draft_step_inputs;
++    bool draft_head_probs = false; // the last DRAFT_HEAD graph was built with the softmax
  
      // sequence embeddings output (map of [n_embd] vectors)
      // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
-@@ -458,6 +505,13 @@ private:
+@@ -458,6 +507,22 @@ private:
  
      llm_graph_result * gf_res_prev_active = nullptr;
  
@@ -16064,10 +16414,19 @@ index 4bea8f6..d1b279a 100644
 +    llm_graph_result *     gf_res_prev_active_inj = nullptr;
 +    ggml_backend_sched_t   last_ubatch_sched      = nullptr;
 +
++    // Wave 14: scheduler for the plain 1-token steps of a speculation target (n_rs_seq > 0). Their graph and its
++    // captured CUDA graph outlive the verification batches in between: a pause cost two graph rebuilds (~9 + ~8 ms).
++    ggml_backend_sched_ptr sched_t1;
++    llm_graph_result_ptr   gf_res_prev_t1;
++    llm_graph_result *     gf_res_prev_active_t1 = nullptr;
++
++    // the scheduler that holds the tensors of the last ubatch
++    ggml_backend_sched_t sched_last() const { return last_ubatch_sched ? last_ubatch_sched : sched.get(); }
++
      // host buffer for the model output (logits and embeddings)
      ggml_backend_buffer_ptr buf_output;
  
-@@ -488,6 +542,18 @@ private:
+@@ -488,6 +553,18 @@ private:
      bool ev_h_nextn_written_recorded = false;
      bool ev_h_nextn_read_recorded    = false;
  
@@ -16119,14 +16478,14 @@ index f4bcf8f..382cacd 100644
 +        llama_token          * resid_token_out,
 +        uint32_t             * accept_mask_out);
 diff --git a/src/llama-grammar.cpp b/src/llama-grammar.cpp
-index bb853b1..9174e0d 100644
+index bb853b1..6befc31 100644
 --- a/src/llama-grammar.cpp
 +++ b/src/llama-grammar.cpp
 @@ -1436,6 +1436,7 @@ struct llama_grammar * llama_grammar_init_impl(
          /* .trigger_buffer_positions = */ {},
          /* .trigger_tokens = */           {},
          /* .trigger_patterns = */         {},
-+        /* .apply_memo = */               nullptr,
++        /* .apply_memo = */               std::make_shared<llama_grammar_apply_memo>(),
      };
  }
  
@@ -16134,7 +16493,7 @@ index bb853b1..9174e0d 100644
          /* .trigger_buffer_positions = */ {},
          std::move(vec_trigger_tokens),
          std::move(vec_trigger_patterns),
-+        /* .apply_memo = */               nullptr,
++        /* .apply_memo = */               std::make_shared<llama_grammar_apply_memo>(),
      };
  }
  
@@ -16219,21 +16578,18 @@ index bb853b1..9174e0d 100644
  void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_data_array * cur_p) {
      GGML_ASSERT(grammar.vocab != nullptr);
  
-@@ -1573,6 +1649,123 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
+@@ -1573,6 +1649,128 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
          return;
      }
  
 +    // the result for a token depends on the grammar state alone: test each (state, token) pair once
 +    static const bool memo_off   = (getenv("W12_NO_GRMR_MEMO") != nullptr);
 +    static const bool memo_check = (getenv("W12_GRMR_MEMO_CHECK") != nullptr);
-+    if (memo_off || cur_p->size <= 256) {
++    if (memo_off || cur_p->size <= 256 || !grammar.apply_memo) {
 +        llama_grammar_apply_eval(grammar, cur_p);
 +        return;
 +    }
 +
-+    if (!grammar.apply_memo) {
-+        grammar.apply_memo = std::make_shared<llama_grammar_apply_memo>();
-+    }
 +    auto & memo = *grammar.apply_memo;
 +    std::lock_guard<std::mutex> lock(memo.mutex);
 +
@@ -16259,7 +16615,14 @@ index bb853b1..9174e0d 100644
 +    }
 +    if (it == memo.entries.end()) {
 +        if (memo.entries.size() >= 64) {
-+            memo.entries.clear();
++            // drop the least recently used state, the others stay warm
++            auto victim = memo.entries.begin();
++            for (auto cur = memo.entries.begin(); cur != memo.entries.end(); ++cur) {
++                if (cur->second.last_use < victim->second.last_use) {
++                    victim = cur;
++                }
++            }
++            memo.entries.erase(victim);
 +        }
 +        it = memo.entries.emplace(key, llama_grammar_apply_memo::entry{}).first;
 +        it->second.stacks       = stacks_sorted;
@@ -16268,6 +16631,7 @@ index bb853b1..9174e0d 100644
 +        it->second.rejected.assign(n_words, 0);
 +    }
 +    auto & e = it->second;
++    e.last_use = ++memo.clock;
 +
 +    static thread_local std::vector<llama_token_data> todo;
 +    static thread_local std::vector<size_t>           todo_idx;
@@ -16343,7 +16707,7 @@ index bb853b1..9174e0d 100644
      bool allow_eog = false;
      for (const auto & stack : grammar.stacks) {
          if (stack.empty()) {
-@@ -1581,11 +1774,98 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
+@@ -1581,11 +1779,98 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
          }
      }
  
@@ -16421,16 +16785,16 @@ index bb853b1..9174e0d 100644
 +            }
 +        }
 +    }
- 
--    llama_grammar_candidates candidates_grammar;
--    candidates_grammar.reserve(cur_p->size);
++
 +    struct pending_cand {
 +        size_t             index;
 +        size_t             cp_offset;
 +        llama_partial_utf8 partial_utf8;
 +        llama_token        id;
 +    };
-+
+ 
+-    llama_grammar_candidates candidates_grammar;
+-    candidates_grammar.reserve(cur_p->size);
 +    static thread_local std::vector<uint32_t>     cp_arena;
 +    static thread_local std::vector<pending_cand> pending;
 +    cp_arena.clear();
@@ -16446,7 +16810,7 @@ index bb853b1..9174e0d 100644
  
      for (size_t i = 0; i < cur_p->size; ++i) {
          const llama_token id      = cur_p->data[i].id;
-@@ -1598,17 +1878,424 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
+@@ -1598,17 +1883,428 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
          } else if (piece.empty() || piece[0] == 0) {
              cur_p->data[i].logit = -INFINITY;
          } else {
@@ -16701,6 +17065,13 @@ index bb853b1..9174e0d 100644
 +    int32_t n_out = 0;
 +    constexpr int MAX_CHARS = 96;
 +
++    // out_tokens[0] carries the whitespace mode on entry, and it is the first slot written below: read it once here
++    //   -3: never guess optional whitespace
++    //   -4: do not guess before the first token, then prefer the compact form
++    //   -2: pretty-printed JSON
++    const int32_t ws_mode   = out_tokens[0];
++    const bool    pretty_nl = ws_mode == -2;
++
 +    while (n_out < max_tokens && !stacks.empty()) {
 +        // 1) Check for strictly forced single token rule (LLAMA_GRETYPE_TOKEN)
 +        bool all_same_tok = true;
@@ -16735,11 +17106,8 @@ index bb853b1..9174e0d 100644
 +        }
 +
 +        // 2) Extract forced literal character sequence (with smart optional-whitespace handling for JSON/tool calls)
-+        // space_after_punct is overloaded via ws_mode encoded in out_tokens[0] sentinel? No — clean bool + nl support:
-+        // When ws_nl (pretty-print) is detected via out_tokens[0] == -2 (passed by common_sampler_grammar_draft_prefix),
-+        // emit "\n  " after '{' and ',' and "\n" before '}'.
-+        const bool strict_no_ws = (max_tokens > 0 && out_tokens[0] == -3);
-+        const bool pretty_nl    = (max_tokens > 0 && out_tokens[0] == -2);
++        // pretty_nl emits "\n  " after '{' and ',' and "\n" before '}'.
++        const bool strict_no_ws = ws_mode == -3 || (ws_mode == -4 && n_out == 0);
 +        std::string lit;
 +        lit.reserve(MAX_CHARS);
 +        int ws_skips = 0;
@@ -16874,7 +17242,7 @@ index bb853b1..9174e0d 100644
      GGML_ASSERT(grammar.vocab != nullptr);
  
 diff --git a/src/llama-grammar.h b/src/llama-grammar.h
-index 5829d8e..71e70ec 100644
+index 5829d8e..402b954 100644
 --- a/src/llama-grammar.h
 +++ b/src/llama-grammar.h
 @@ -4,8 +4,10 @@
@@ -16888,7 +17256,7 @@ index 5829d8e..71e70ec 100644
  #include <vector>
  
  struct llama_vocab;
-@@ -126,6 +128,19 @@ struct llama_grammar_trigger_pattern {
+@@ -126,6 +128,21 @@ struct llama_grammar_trigger_pattern {
      size_t find(const std::string & input) const;
  };
  
@@ -16899,16 +17267,18 @@ index 5829d8e..71e70ec 100644
 +        llama_partial_utf8    partial_utf8;
 +        std::vector<uint64_t> known;    // one bit per token id
 +        std::vector<uint64_t> rejected; // one bit per token id
++        uint64_t              last_use = 0;
 +    };
 +
 +    std::mutex mutex;
++    uint64_t   clock = 0;
 +    std::unordered_map<uint64_t, entry> entries;
 +};
 +
  struct llama_grammar {
      // maintain a list of llama_tokens and their positions in the trigger_buffer
      using token_pos = std::pair<llama_token, std::pair<size_t, size_t>>;
-@@ -151,6 +166,8 @@ struct llama_grammar {
+@@ -151,6 +168,8 @@ struct llama_grammar {
                               trigger_patterns;         // Regular expressions that trigger a lazy grammar. Must be a full match of the entire generated
                                                         // string, and the grammar will be given the string from the first match group onwards.
  
@@ -16917,7 +17287,7 @@ index 5829d8e..71e70ec 100644
  };
  
  //
-@@ -195,3 +212,9 @@ void llama_grammar_accept_token(
+@@ -195,3 +214,9 @@ void llama_grammar_accept_token(
                struct llama_grammar & grammar,
                         llama_token   token,
                   const std::string & piece);
@@ -17218,7 +17588,7 @@ index 269b920..fe1cceb 100644
      }
  }
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 41c14b7..cf38f41 100644
+index 41c14b7..e7b0f17 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -46,6 +46,7 @@ enum llm_graph_type {
@@ -17245,7 +17615,23 @@ index 41c14b7..cf38f41 100644
  
      const uint32_t extent;
      const uint32_t extent_swa;
-@@ -1334,6 +1340,14 @@ struct llm_graph_context {
+@@ -950,6 +956,15 @@ struct llm_graph_params {
+             }
+         }
+ 
++        // a graph can depend on which rows are outputs (the DSpark block skips the rows before and after them)
++        if (samplers.empty() && n_outputs > 0 && n_outputs < ubatch.n_tokens && ubatch.data && other.ubatch.data) {
++            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++                if (ubatch.output[i] != other.ubatch.output[i]) {
++                    return false;
++                }
++            }
++        }
++
+         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
+         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+             return false;
+@@ -1334,6 +1349,14 @@ struct llm_graph_context {
      // attention
      //
  
@@ -17260,7 +17646,7 @@ index 41c14b7..cf38f41 100644
      ggml_tensor * build_attn_mha(
              ggml_tensor * q,       // [n_embd_head_q, n_head_q, n_tokens]
              ggml_tensor * k,       // [n_embd_head_k, n_head_k, n_tokens]
-@@ -1345,7 +1359,8 @@ struct llm_graph_context {
+@@ -1345,7 +1368,8 @@ struct llm_graph_context {
              ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                  int64_t   n_kv_max,
                    float   kq_scale,
@@ -17270,7 +17656,7 @@ index 41c14b7..cf38f41 100644
  
      llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
  
-@@ -1513,12 +1528,13 @@ struct llm_graph_context {
+@@ -1513,12 +1537,13 @@ struct llm_graph_context {
  
      // store the conv history of the ubatch cells, the last n_cols columns of conv_x {n_cols + n_seq_tokens, channels, n_seqs},
      // at byte offset offs of each row of s, and with n_rs_seq > 0 once per rollback slot of this ubatch
@@ -17286,7 +17672,7 @@ index 41c14b7..cf38f41 100644
  
      ggml_tensor * build_rwkv_token_shift_load(
          llm_graph_input_rs * inp,
-@@ -1543,7 +1559,7 @@ struct llm_graph_context {
+@@ -1543,7 +1568,7 @@ struct llm_graph_context {
              uint32_t extent,
              uint32_t extent_swa) const;
  
@@ -17295,7 +17681,7 @@ index 41c14b7..cf38f41 100644
      ggml_tensor * build_attn(
              llm_graph_input_mem_hybrid_iswa_rel * inp,
              ggml_tensor * wo,
-@@ -1555,7 +1571,10 @@ struct llm_graph_context {
+@@ -1555,7 +1580,10 @@ struct llm_graph_context {
              ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
              ggml_tensor * sinks, // [n_head_q]
                    float   kq_scale,
@@ -18326,7 +18712,7 @@ index b4034dd..aeee1df 100644
  
      std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
-index eb5781e..0d8caf8 100644
+index eb5781e..5f529e8 100644
 --- a/tools/server/server-common.cpp
 +++ b/tools/server/server-common.cpp
 @@ -354,70 +354,70 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
@@ -18589,7 +18975,7 @@ index eb5781e..0d8caf8 100644
          /* parse_special */ true,
      };
      mtmd::input_chunks chunks(mtmd_input_chunks_init());
-@@ -1185,6 +1271,502 @@ server_tokens process_mtmd_prompt(
+@@ -1185,6 +1271,556 @@ server_tokens process_mtmd_prompt(
      return result;
  }
  
@@ -18629,6 +19015,7 @@ index eb5781e..0d8caf8 100644
 +    uint64_t tick = 0;
 +    uint64_t next_entry_id = 0;
 +    std::unordered_map<const llama_vocab *, std::unordered_set<llama_token>> prefix_free_controls;
++    std::unordered_map<const llama_vocab *, bool> split_safe;
 +    std::unordered_map<std::string, w13_img_entry> img_lru;
 +    std::vector<w13_prompt_entry> entries;
 +};
@@ -18704,6 +19091,40 @@ index eb5781e..0d8caf8 100644
 +    }
 +    const auto & set = w13_get_prefix_free_controls_locked(cache, vocab);
 +    return set.find(tok) != set.end();
++}
++
++// The cache reuses the tokens of a prefix that ends in a control token and tokenizes the rest alone.
++// That only gives the tokens of the whole prompt if the tokenizer treats the text after a control token
++// like the start of an input (not true with a metaspace or space prefix added to the first fragment only).
++bool w13_vocab_split_safe_locked(w13_cache_state & cache, const llama_vocab * vocab) {
++    auto it = cache.split_safe.find(vocab);
++    if (it != cache.split_safe.end()) {
++        return it->second;
++    }
++    bool safe = false;
++    const auto & controls = w13_get_prefix_free_controls_locked(cache, vocab);
++    if (!controls.empty()) {
++        const llama_token ctrl  = *std::min_element(controls.begin(), controls.end());
++        const std::string piece = w13_token_piece(vocab, ctrl);
++        safe = !piece.empty();
++        for (const char * tail : { " again, and again.", "Next line\n", "\n\nAnother paragraph" }) {
++            if (!safe) {
++                break;
++            }
++            const std::string head = "Hello world";
++            llama_tokens whole = common_tokenize(vocab, head + piece + tail, /*add_special=*/true,  /*parse_special=*/true);
++            llama_tokens split = common_tokenize(vocab, head + piece,        /*add_special=*/true,  /*parse_special=*/true);
++            llama_tokens rest  = common_tokenize(vocab, tail,                /*add_special=*/false, /*parse_special=*/true);
++            safe = !split.empty() && split.back() == ctrl;
++            split.insert(split.end(), rest.begin(), rest.end());
++            safe = safe && split == whole;
++        }
++    }
++    if (!safe) {
++        SRV_WRN("%s", "the tokenizer does not split cleanly at control tokens, the prompt token cache is off\n");
++    }
++    cache.split_safe.emplace(vocab, safe);
++    return safe;
 +}
 +
 +void w13_img_lru_put_locked(w13_cache_state & cache, const std::string & cid, w13_media_chunk_sptr chunk) {
@@ -18788,14 +19209,24 @@ index eb5781e..0d8caf8 100644
 +        return server_tokens(common_tokenize(vocab, prompt, true, true), false);
 +    }
 +
++    auto & cache = w13_get_cache();
++
++    {
++        std::lock_guard<std::mutex> lock(cache.mtx);
++        if (!w13_vocab_split_safe_locked(cache, vocab)) {
++            if (mctx != nullptr) {
++                return process_mtmd_prompt(mctx, prompt, files, init_opt);
++            }
++            return server_tokens(common_tokenize(vocab, prompt, true, true), false);
++        }
++    }
++
 +    // Hash incoming media payloads outside the lock
 +    std::vector<server_tokens::prefix_hash> file_hashes;
 +    file_hashes.reserve(files.size());
 +    for (const auto & f : files) {
 +        file_hashes.push_back(hash_sha256(f.data(), f.size()));
 +    }
-+
-+    auto & cache = w13_get_cache();
 +
 +    bool found_hit = false;
 +    uint64_t hit_entry_id = 0;
@@ -19008,6 +19439,15 @@ index eb5781e..0d8caf8 100644
 +    return result;
 +}
 +
++void w13_cache_clear() {
++    auto & cache = w13_get_cache();
++    std::lock_guard<std::mutex> lock(cache.mtx);
++    cache.entries.clear();
++    cache.img_lru.clear();
++    cache.prefix_free_controls.clear();
++    cache.split_safe.clear();
++}
++
 +void w13_prompt_cache_append_generated(
 +        const llama_vocab * vocab,
 +        uint64_t entry_id,
@@ -19092,7 +19532,7 @@ index eb5781e..0d8caf8 100644
  /**
   * tokenize a single input "prompt" object
   * use tokenize_input_prompts() if the input could be an array.
-@@ -1385,29 +1967,36 @@ void handle_media(
+@@ -1385,29 +2021,36 @@ void handle_media(
          out_files.push_back(data);
  
      } else if (string_starts_with(url, "data:")) {
@@ -19143,7 +19583,7 @@ index eb5781e..0d8caf8 100644
  }
  // load media files from an OAI content array, then replace each media part with a media marker text part
 diff --git a/tools/server/server-common.h b/tools/server/server-common.h
-index 911bb31..bc0aba0 100644
+index 911bb31..11f1ae4 100644
 --- a/tools/server/server-common.h
 +++ b/tools/server/server-common.h
 @@ -18,10 +18,13 @@
@@ -19212,7 +19652,7 @@ index 911bb31..bc0aba0 100644
      }
  
      void keep_first(size_t n);
-@@ -287,8 +310,49 @@ public:
+@@ -287,8 +310,52 @@ public:
      bool validate(const struct llama_context * ctx) const;
  
      server_tokens clone() const;
@@ -19246,6 +19686,9 @@ index 911bb31..bc0aba0 100644
 +        uint64_t & out_entry_id,
 +        size_t & out_entry_tok_end);
 +
++// drop everything keyed by a vocab or a multimodal context, to call before they are freed
++void w13_cache_clear();
++
 +void w13_prompt_cache_append_generated(
 +        const llama_vocab * vocab,
 +        uint64_t entry_id,
@@ -19262,7 +19705,7 @@ index 911bb31..bc0aba0 100644
  
  //
  // tokenizer and input processing utils
-@@ -338,7 +402,8 @@ server_tokens process_mtmd_prompt(
+@@ -338,7 +405,8 @@ server_tokens process_mtmd_prompt(
                                          const std::string & prompt,
                                          const std::vector<raw_buffer> & files,
                                           const mtmd_helper_init_opt & init_opt,
@@ -19273,7 +19716,7 @@ index 911bb31..bc0aba0 100644
  // decode one media url (http/file/data-uri) into out_files; throws on failure
  void handle_media(std::vector<raw_buffer> & out_files, const std::string & url, const std::string & media_path, bool allow_private_urls);
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index f821ac6..022b504 100644
+index f821ac6..4934c60 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -25,6 +25,7 @@
@@ -19438,7 +19881,17 @@ index f821ac6..022b504 100644
          }
  
          common_speculative_print_stats(spec);
-@@ -1266,7 +1373,8 @@ private:
+@@ -1154,6 +1261,9 @@ private:
+     int64_t t_last_load_progress_ms = 0;
+ 
+     void destroy() {
++        // the entries hold pointers to the vocab and to mctx
++        w13_cache_clear();
++
+         spec.reset();
+         spec_init.reset();
+ 
+@@ -1266,7 +1376,8 @@ private:
              mparams.use_gpu          = params_base.mmproj_use_gpu;
              mparams.device           = params_base.mmproj_device;
              mparams.print_timings    = false;
@@ -19448,7 +19901,7 @@ index f821ac6..022b504 100644
              mparams.flash_attn_type  = params_base.flash_attn_type;
              mparams.warmup           = params_base.warmup;
              mparams.image_min_tokens = params_base.image_min_tokens;
-@@ -2028,9 +2136,19 @@ private:
+@@ -2028,9 +2139,19 @@ private:
              // TODO: check verify if this actually works with TTS
              use_backend_sampling &= task.type != SERVER_TASK_TYPE_TTS;
  
@@ -19468,7 +19921,7 @@ index f821ac6..022b504 100644
              } else {
                  llama_set_sampler(ctx_tgt, slot.id, nullptr);
              }
-@@ -2096,6 +2214,7 @@ private:
+@@ -2096,6 +2217,7 @@ private:
          slot.sampled = result.tok;
  
          slot.generated.append(token_str, result.tok);
@@ -19476,7 +19929,7 @@ index f821ac6..022b504 100644
          if (slot.task->params.return_tokens) {
              slot.generated_tokens.push_back(result.tok);
          }
-@@ -2369,6 +2488,36 @@ private:
+@@ -2369,6 +2491,36 @@ private:
              slot.debug_generated_text = slot.generated.text;
          }
  
@@ -19513,19 +19966,19 @@ index f821ac6..022b504 100644
          // in stream mode, content and tokens are already in last partial chunk
          if (slot.task->params.stream) {
              res->content     = {};
-@@ -2378,7 +2527,10 @@ private:
+@@ -2378,7 +2530,10 @@ private:
              res->tokens      = std::move(slot.generated_tokens);
          }
          res->stats           = slot.stats;
 -        res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
-+        // Wave 13.4: res->prompt is only serialized by to_json_non_oaicompat() (TASK_RESPONSE_TYPE_NONE)
-+        if (slot.task->params.res_type == TASK_RESPONSE_TYPE_NONE) {
++        // Wave 13.4: res->prompt is only serialized by to_json_non_oaicompat() (TASK_RESPONSE_TYPE_NONE or "__verbose")
++        if (slot.task->params.res_type == TASK_RESPONSE_TYPE_NONE || slot.task->params.verbose) {
 +            res->prompt      = slot.task->tokens.detokenize(ctx_tgt, true);
 +        }
          res->response_fields = std::move(slot.task->params.response_fields);
  
          res->truncated             = slot.truncated;
-@@ -2721,10 +2873,20 @@ private:
+@@ -2721,10 +2876,20 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -19546,7 +19999,48 @@ index f821ac6..022b504 100644
  
          slot.prompt.checkpoints.push_back(std::move(ckpt));
  
-@@ -3836,7 +3998,12 @@ private:
+@@ -3824,6 +3989,40 @@ private:
+ 
+             generating.push_back(&slot);
+ 
++            // Wave 10B + Wave 10D: periodic generation context checkpoint for SWA/hybrid/recurrent models
++            // Works for both text-only and post-image multimodal sessions (once at a verified text boundary).
++            const auto gen_checkpoint = [&](llama_pos ckpt_pos_min, llama_pos ckpt_pos_max) {
++                static const bool w10_no_gen_ckpt  = (getenv("W10_NO_GEN_CKPT")  != nullptr);
++                static const bool w10_no_mtmd_ckpt = (getenv("W10_NO_MTMD_CKPT") != nullptr);
++                const bool need_ctx_ckpt =
++                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
++                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
++                        n_swa > 0;
++                const bool gen_ckpt_tok_ok = slot.prompt.tokens.get_text_tokens_direct() != nullptr ||
++                        (!w10_no_mtmd_ckpt && slot.prompt.n_tokens() >= 2 &&
++                         slot.prompt.tokens[slot.prompt.n_tokens() - 1] != LLAMA_TOKEN_NULL &&
++                         slot.prompt.tokens[slot.prompt.n_tokens() - 2] != LLAMA_TOKEN_NULL &&
++                         ckpt_pos_max + 1 == slot.prompt.tokens.pos_next());
++                if (!w10_no_gen_ckpt && params_base.n_ctx_checkpoints > 0 && need_ctx_ckpt &&
++                        gen_ckpt_tok_ok && slot.stats.n_gen >= 2048 &&
++                        ckpt_pos_min >= 0 && ckpt_pos_max >= ckpt_pos_min) {
++                    const int32_t gen_ckpt_step = std::min<int32_t>(std::max<int32_t>(params_base.checkpoint_min_step, 2048), 4096);
++                    if (slot.prompt.checkpoints.empty() ||
++                            slot.prompt.n_tokens() >= slot.prompt.checkpoints.back()->n_tokens + gen_ckpt_step) {
++                        create_checkpoint(slot, 0, ckpt_pos_min, ckpt_pos_max);
++                        SLT_INF(slot, "wave10 gen checkpoint created (n_tokens = %d, pos = [%d, %d], total = %zu)\n",
++                                slot.prompt.n_tokens(), ckpt_pos_min, ckpt_pos_max, slot.prompt.checkpoints.size());
++                    }
++                }
++            };
++
++            // without a draft to prepare, the checkpoint is taken here (the speculative path takes it below)
++            if (!spec || slot.get_n_draft_max() <= 0) {
++                gen_checkpoint(
++                        llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
++                        llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
++            }
++
+             if (spec) {
+                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+ 
+@@ -3836,7 +4035,12 @@ private:
                      GGML_ASSERT(slot.can_speculate());
  
                      // stale candidates: a replay never reads them, a new draft refills them
@@ -19560,37 +20054,14 @@ index f821ac6..022b504 100644
  
                      if (!slot.spec_draft.empty()) {
                          // we have a previous (partial) draft to reuse
-@@ -3846,29 +4013,94 @@ private:
+@@ -3846,29 +4050,74 @@ private:
                      } else {
                          GGML_ASSERT(slot.spec_i_batch.empty());
  
 +                        const llama_pos ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
 +                        const llama_pos ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 +
-+                        // Wave 10B + Wave 10D: periodic generation context checkpoint for SWA/hybrid/recurrent models
-+                        // Works for both text-only and post-image multimodal sessions (once at a verified text boundary).
-+                        static const bool w10_no_gen_ckpt  = (getenv("W10_NO_GEN_CKPT")  != nullptr);
-+                        static const bool w10_no_mtmd_ckpt = (getenv("W10_NO_MTMD_CKPT") != nullptr);
-+                        const bool need_ctx_ckpt =
-+                                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-+                                ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
-+                                n_swa > 0;
-+                        const bool gen_ckpt_tok_ok = slot.prompt.tokens.get_text_tokens_direct() != nullptr ||
-+                                (!w10_no_mtmd_ckpt && slot.prompt.n_tokens() >= 2 &&
-+                                 slot.prompt.tokens[slot.prompt.n_tokens() - 1] != LLAMA_TOKEN_NULL &&
-+                                 slot.prompt.tokens[slot.prompt.n_tokens() - 2] != LLAMA_TOKEN_NULL &&
-+                                 ckpt_pos_max + 1 == slot.prompt.tokens.pos_next());
-+                        if (!w10_no_gen_ckpt && params_base.n_ctx_checkpoints > 0 && need_ctx_ckpt &&
-+                                gen_ckpt_tok_ok && slot.stats.n_gen >= 2048 &&
-+                                ckpt_pos_min >= 0 && ckpt_pos_max >= ckpt_pos_min) {
-+                            const int32_t gen_ckpt_step = std::min<int32_t>(std::max<int32_t>(params_base.checkpoint_min_step, 2048), 4096);
-+                            if (slot.prompt.checkpoints.empty() ||
-+                                    slot.prompt.n_tokens() >= slot.prompt.checkpoints.back()->n_tokens + gen_ckpt_step) {
-+                                create_checkpoint(slot, 0, ckpt_pos_min, ckpt_pos_max);
-+                                SLT_INF(slot, "wave10 gen checkpoint created (n_tokens = %d, pos = [%d, %d], total = %zu)\n",
-+                                        slot.prompt.n_tokens(), ckpt_pos_min, ckpt_pos_max, slot.prompt.checkpoints.size());
-+                            }
-+                        }
++                        gen_checkpoint(ckpt_pos_min, ckpt_pos_max);
 +
                          slot.spec_ckpt.update_pos(
                                  slot.prompt.n_tokens(),
@@ -19618,7 +20089,10 @@ index f821ac6..022b504 100644
 +                                    g_draft.resize(g_max);
 +                                    slot.spec_draft = std::move(g_draft);
 +                                    slot.spec_draft_q.clear();
-+                                    slot.spec_draft_q_probs.clear();
++                                    // keep the capacity of the inner vectors, as above
++                                    for (auto & v : slot.spec_draft_q_probs) {
++                                        v.clear();
++                                    }
 +                                    slot.spec_draft_q_ctx = nullptr;
 +                                    slot.spec_pause_left    = 0;
 +                                    slot.spec_verif_streak  = 0;
@@ -19667,7 +20141,7 @@ index f821ac6..022b504 100644
                          };
  
                          drafting.push_back(&slot);
-@@ -3934,6 +4166,13 @@ private:
+@@ -3934,6 +4183,13 @@ private:
  
          // update the batch with the sampled/drafted tokens
          iterate(generating, [&](server_slot & slot) {
@@ -19681,7 +20155,7 @@ index f821ac6..022b504 100644
              slot.handle_last_sampled_token(batch);
          });
  
-@@ -4271,6 +4510,10 @@ private:
+@@ -4271,6 +4527,10 @@ private:
  
                          slot.prompt.tokens.keep_first(n_past);
  
@@ -19692,7 +20166,7 @@ index f821ac6..022b504 100644
                          // this is to signal the client that the request has started processing
                          if (slot.task->params.stream) {
                              if (slot.task->params.return_progress) {
-@@ -4403,6 +4646,14 @@ private:
+@@ -4403,6 +4663,14 @@ private:
                      const auto & spans = slot.task->params.message_spans;
                      const auto last_user_pos = spans.last_user_message_pos();
  
@@ -19707,7 +20181,7 @@ index f821ac6..022b504 100644
                      const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
  
                      // add prompt tokens for processing in the current batch
-@@ -4451,31 +4702,52 @@ private:
+@@ -4451,31 +4719,52 @@ private:
                          if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
                              const auto pos = slot.prompt.n_tokens();
                              const auto & checkpoints = slot.prompt.checkpoints;
@@ -19775,7 +20249,7 @@ index f821ac6..022b504 100644
                          }
                      }
  
-@@ -4527,10 +4799,13 @@ private:
+@@ -4527,10 +4816,13 @@ private:
                      // do not checkpoint after mtmd chunks
                      do_checkpoint = do_checkpoint && !has_mtmd;
  
@@ -19791,7 +20265,7 @@ index f821ac6..022b504 100644
                              n_tokens_start > slot.prompt.checkpoints.back()->n_tokens + params_base.checkpoint_min_step);
                      SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
  
-@@ -4642,15 +4917,20 @@ private:
+@@ -4642,15 +4934,20 @@ private:
              has_output |= batch.tokens[i].output;
          }
  
@@ -19813,7 +20287,7 @@ index f821ac6..022b504 100644
  
          if (ret != 0) {
              {
-@@ -4721,6 +5001,12 @@ private:
+@@ -4721,6 +5018,12 @@ private:
                  throw std::runtime_error("failed to process speculative batch");
              }
          }
@@ -19826,7 +20300,7 @@ index f821ac6..022b504 100644
  
          // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
          for (auto & slot : slots) {
-@@ -4812,6 +5098,42 @@ private:
+@@ -4812,6 +5115,42 @@ private:
                  // prompt evaluated for next-token prediction
                  slot.state = SLOT_STATE_GENERATING;
  
@@ -19869,7 +20343,7 @@ index f821ac6..022b504 100644
                  if (slot.can_speculate()) {
                      common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                  }
-@@ -4848,6 +5170,7 @@ private:
+@@ -4848,6 +5187,7 @@ private:
              }
  
              slot.stats.update_gen_last();
@@ -19877,7 +20351,7 @@ index f821ac6..022b504 100644
  
              completion_token_output result;
              result.tok          = id;
-@@ -4858,6 +5181,49 @@ private:
+@@ -4858,6 +5198,49 @@ private:
                  populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
              }
  
@@ -19927,7 +20401,7 @@ index f821ac6..022b504 100644
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
-@@ -4885,16 +5251,25 @@ private:
+@@ -4885,16 +5268,25 @@ private:
              // batch indices of the draft tokens, used to get the token probabilities below
              auto spec_i_batch = std::move(slot.spec_i_batch);
  
@@ -19955,7 +20429,7 @@ index f821ac6..022b504 100644
  
                  std::vector<llama_token> accepted;
                  if (!synth_probs.empty()) {
-@@ -4904,6 +5279,10 @@ private:
+@@ -4904,6 +5296,10 @@ private:
                              synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                  } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
                      accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft);
@@ -19966,7 +20440,7 @@ index f821ac6..022b504 100644
                  } else if (use_rejection) {
                      accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                  } else {
-@@ -4914,11 +5293,6 @@ private:
+@@ -4914,11 +5310,6 @@ private:
  
                  const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
  
@@ -19978,7 +20452,7 @@ index f821ac6..022b504 100644
                  // check for partial draft acceptance
                  if (n_rollback > 0) {
                      if (use_ckpt_tgt) {
-@@ -4960,18 +5334,81 @@ private:
+@@ -4960,18 +5351,81 @@ private:
  
              const auto ids = std::move(slot.spec_draft);
  
@@ -20061,7 +20535,7 @@ index f821ac6..022b504 100644
              auto & n_accepted_per_pos = slot.n_accepted_per_pos;
              if (n_accepted_per_pos.empty()) {
                  n_accepted_per_pos.resize(common_speculative_n_max(spec.get()), 0);
-@@ -4996,6 +5433,18 @@ private:
+@@ -4996,6 +5450,18 @@ private:
                  result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
                  result.prob         = 1.0f; // set later
  
@@ -20080,7 +20554,7 @@ index f821ac6..022b504 100644
                  // post_sampling_probs is not supported with speculative decoding
                  if (slot.task->params.sampling.n_probs > 0 && !slot.task->params.post_sampling_probs) {
                      populate_token_probs(slot, result, false, params_base.special, spec_i_batch[i]);
-@@ -5314,8 +5763,33 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+@@ -5314,8 +5780,33 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
  
          // process prompt
          std::vector<server_tokens> inputs;
@@ -20115,7 +20589,7 @@ index f821ac6..022b504 100644
              // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
              inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
          } else {
-@@ -5331,6 +5805,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+@@ -5331,6 +5822,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
              task.id = rd.get_new_id();
  
              task.tokens = std::move(inputs[i]);
